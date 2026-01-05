@@ -79,6 +79,8 @@ Route::middleware(['auth'])->group(function () {
         Route::get('/dashboard', [CaissiereController::class, 'dashboard'])->name('dashboard');
         Route::get('/loans/{id}', [CaissiereController::class, 'show'])->name('loans.show')->middleware('permission:view-repayments');
         Route::get('/loans/{id}/schedule', [CaissiereController::class, 'schedule'])->name('loans.schedule')->middleware('permission:view-repayment-schedule');
+        Route::get('/loans/{id}/early-repayment', [CaissiereController::class, 'earlyRepaymentForm'])->name('loans.early-repayment')->middleware('permission:create-repayments');
+        Route::post('/loans/{id}/early-repayment', [CaissiereController::class, 'processEarlyRepayment'])->name('loans.early-repayment.process')->middleware('permission:create-repayments');
         Route::post('/loans/{id}/repayment', [CaissiereController::class, 'recordRepayment'])->name('loans.repayment')->middleware('permission:create-repayments');
         Route::get('/repayments', [CaissiereController::class, 'index'])->name('repayments.index')->middleware('permission:view-repayments');
         Route::get('/repayments/create', [CaissiereController::class, 'create'])->name('repayments.create')->middleware('permission:create-repayments');

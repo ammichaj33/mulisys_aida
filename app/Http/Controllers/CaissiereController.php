@@ -9,6 +9,7 @@ use App\Models\LoanRepayment;
 use App\Models\RepaymentType;
 use App\Models\Penalty;
 use App\Models\Historique;
+use App\Models\InterestCancellation;
 use App\Services\LoanCalculationService;
 use App\Services\CashflowService;
 use Carbon\Carbon;
@@ -828,5 +829,205 @@ class CaissiereController extends Controller
 
         return redirect()->route('caissiere.penalties.index')
             ->with('success', 'Pénalité payée avec succès.');
+    }
+
+    /**
+     * Afficher le formulaire de remboursement anticipé
+     */
+    public function earlyRepaymentForm($id)
+    {
+        $loan = LoanDoc::with([
+            'member',
+            'loanRepayments.repaymentType',
+            'loanRepayments.user',
+            'penalties'
+        ])->findOrFail($id);
+
+        // Vérifier que le crédit est validé
+        if ($loan->status !== 'validated') {
+            return redirect()->route('caissiere.loans.show', $loan->loanDocId)
+                ->with('error', 'Seuls les crédits validés peuvent être remboursés de manière anticipée.');
+        }
+
+        $calculationService = new LoanCalculationService();
+        
+        // Calculer les intérêts et montants
+        $interestCalculation = $calculationService->calculateMonthlyDegressiveInterest(
+            $loan->requestAmount,
+            $loan->interestRate,
+            $loan->loanMonths,
+            $loan->submitDate->format('Y-m-d')
+        );
+        
+        $totalCancelledInterest = $calculationService->getCancelledInterest($loan->loanDocId);
+        $totalAmountDue = $loan->requestAmount + $interestCalculation['total_interest'] - $totalCancelledInterest;
+        $totalRepaid = $loan->loanRepayments->sum('amount');
+        $remainingAmount = round($totalAmountDue - $totalRepaid, 2);
+
+        // Si déjà entièrement remboursé
+        if ($remainingAmount <= 0) {
+            return redirect()->route('caissiere.loans.show', $loan->loanDocId)
+                ->with('error', 'Ce crédit est déjà entièrement remboursé.');
+        }
+
+        // Calculer les détails du remboursement anticipé (par défaut avec la date d'aujourd'hui)
+        $earlyRepaymentDetails = $calculationService->calculateEarlyRepaymentInterest(
+            $loan,
+            now()->format('Y-m-d')
+        );
+
+        // Récupérer le type de remboursement "Remboursement anticipé"
+        $earlyRepaymentType = RepaymentType::where('isActive', true)
+            ->where(function($query) {
+                $query->where('repaymentName', 'like', '%Remboursement anticipé%')
+                      ->orWhere('repaymentName', 'like', '%anticipé%')
+                      ->orWhere('repaymentName', 'like', '%Anticipé%')
+                      ->orWhere('repaymentName', 'like', '%Anticipe%')
+                      ->orWhere('repaymentName', 'like', '%anticip%');
+            })
+            ->first();
+        
+        // Si le type n'existe pas, chercher par défaut ou créer un message d'erreur
+        if (!$earlyRepaymentType) {
+            // Essayer de trouver n'importe quel type actif comme fallback
+            $earlyRepaymentType = RepaymentType::where('isActive', true)->first();
+        }
+
+        return view('caissiere.early-repayment', compact(
+            'loan',
+            'calculationService',
+            'interestCalculation',
+            'totalCancelledInterest',
+            'totalAmountDue',
+            'totalRepaid',
+            'remainingAmount',
+            'earlyRepaymentDetails',
+            'earlyRepaymentType'
+        ));
+    }
+
+    /**
+     * Traiter le remboursement anticipé
+     */
+    public function processEarlyRepayment(Request $request, $id)
+    {
+        $loan = LoanDoc::with('loanRepayments')->findOrFail($id);
+
+        // Vérifier que le crédit est validé
+        if ($loan->status !== 'validated') {
+            return back()->withErrors([
+                'status' => 'Seuls les crédits validés peuvent être remboursés de manière anticipée.'
+            ])->withInput();
+        }
+
+        $request->validate([
+            'amount' => 'required|numeric|min:0.01',
+            'repaymentDate' => 'required|date',
+            'repaymentTypeIdFk' => 'required|exists:repaymenttype,repaymentTypeID',
+            'description' => 'nullable|string|max:500',
+            'confirm_early_repayment' => 'required|accepted'
+        ]);
+
+        $repaymentDate = Carbon::parse($request->repaymentDate);
+        
+        // Vérifier que la date n'est pas antérieure à la date d'octroi
+        if ($repaymentDate->lt($loan->submitDate)) {
+            return back()->withErrors([
+                'repaymentDate' => 'La date de remboursement ne peut pas être antérieure à la date d\'octroi du crédit (' . $loan->submitDate->format('d/m/Y') . ').'
+            ])->withInput();
+        }
+
+        $calculationService = new LoanCalculationService();
+        
+        // Calculer les détails du remboursement anticipé
+        $earlyRepaymentDetails = $calculationService->calculateEarlyRepaymentInterest(
+            $loan,
+            $request->repaymentDate
+        );
+
+        // Vérifier que c'est bien un remboursement anticipé
+        if (!$earlyRepaymentDetails['isEarlyRepayment']) {
+            return back()->withErrors([
+                'amount' => 'Ce n\'est pas un remboursement anticipé. Utilisez le formulaire de remboursement normal.'
+            ])->withInput();
+        }
+
+        // Calculer le montant total dû avec intérêts annulés
+        $interestCalculation = $calculationService->calculateMonthlyDegressiveInterest(
+            $loan->requestAmount,
+            $loan->interestRate,
+            $loan->loanMonths,
+            $loan->submitDate->format('Y-m-d')
+        );
+        
+        $totalCancelledInterest = $calculationService->getCancelledInterest($loan->loanDocId);
+        $totalAmountDue = $loan->requestAmount + $interestCalculation['total_interest'] - $totalCancelledInterest;
+        $totalRepaid = $loan->loanRepayments->sum('amount');
+        
+        // Le montant total à payer pour un remboursement anticipé complet
+        $expectedAmount = $earlyRepaymentDetails['montantTotal'];
+        
+        // Vérifier que le montant correspond (avec tolérance)
+        $tolerance = 0.01; // 1 centime de tolérance
+        if (abs($request->amount - $expectedAmount) > $tolerance) {
+            return back()->withErrors([
+                'amount' => 'Le montant doit être exactement ' . number_format($expectedAmount, 2, ',', ' ') . ' USD pour un remboursement anticipé complet.'
+            ])->withInput();
+        }
+
+        // Utiliser une transaction pour garantir la cohérence
+        \DB::beginTransaction();
+        try {
+            // Créer le remboursement
+            $repayment = LoanRepayment::create([
+                'amount' => $request->amount,
+                'loanDocIdFk' => $loan->loanDocId,
+                'repaymentDate' => $request->repaymentDate,
+                'repaymentTypeIdFk' => $request->repaymentTypeIdFk,
+                'userIdFk' => Auth::id(),
+                'description' => $request->description ?? 'Remboursement anticipé'
+            ]);
+
+            // Créer les enregistrements d'annulation d'intérêts
+            foreach ($earlyRepaymentDetails['monthsToCancel'] as $monthData) {
+                InterestCancellation::create([
+                    'loanDocIdFk' => $loan->loanDocId,
+                    'repaymentIdFk' => $repayment->loanRepaymentId,
+                    'cancelledMonth' => $monthData['month'],
+                    'cancelledInterestAmount' => $monthData['interest']
+                ]);
+            }
+
+            // Enregistrer dans le cashflow
+            $cashflowService = new CashflowService();
+            $cashflowService->recordRepayment($repayment, $loan);
+
+            // Marquer le crédit comme terminé
+            $loan->update([
+                'status' => 'done',
+                'endedDate' => $repaymentDate
+            ]);
+
+            // Log dans l'historique
+            $totalInterestCancelled = $earlyRepaymentDetails['interetsACanceler'];
+            Historique::create([
+                'recordIdFk' => $loan->loanDocId,
+                'recordStatus' => 'early_repayment',
+                'operDescription' => 'Remboursement anticipé: ' . number_format($request->amount, 2) . ' USD - Intérêts annulés: ' . number_format($totalInterestCancelled, 2) . ' USD',
+                'userIdFk' => Auth::id()
+            ]);
+
+            \DB::commit();
+
+            return redirect()->route('caissiere.loans.show', $loan->loanDocId)
+                ->with('success', 'Remboursement anticipé enregistré avec succès. ' . count($earlyRepaymentDetails['monthsToCancel']) . ' mois d\'intérêts ont été annulés.');
+
+        } catch (\Exception $e) {
+            \DB::rollBack();
+            
+            return back()->withErrors([
+                'error' => 'Une erreur est survenue lors de l\'enregistrement: ' . $e->getMessage()
+            ])->withInput();
+        }
     }
 }

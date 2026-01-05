@@ -102,6 +102,94 @@ class LoanCalculationService
     }
     
     /**
+     * Calculer les détails d'un remboursement anticipé
+     * 
+     * @param LoanDoc $loan Le crédit concerné
+     * @param string $repaymentDate La date de remboursement anticipé (format Y-m-d)
+     * @return array Contient: capitalRestant, interetsDus, interetsACanceler, montantTotal, monthsToCancel
+     */
+    public function calculateEarlyRepaymentInterest($loan, $repaymentDate)
+    {
+        // Calculer l'échéancier complet
+        $interestCalculation = $this->calculateMonthlyDegressiveInterest(
+            $loan->requestAmount,
+            $loan->interestRate,
+            $loan->loanMonths,
+            $loan->submitDate->format('Y-m-d')
+        );
+        
+        $schedule = $interestCalculation['schedule'];
+        
+        // Calculer le capital déjà remboursé
+        $totalRepaid = $loan->loanRepayments->sum('amount');
+        
+        // Calculer le capital restant (approximation : montant initial - remboursements)
+        // Note: Cette approche est simplifiée. En réalité, il faudrait calculer
+        // combien de capital a été remboursé vs intérêts dans chaque paiement
+        $capitalRepaid = 0;
+        $capitalRestant = $loan->requestAmount;
+        
+        // Approche simplifiée : si le total remboursé est inférieur au capital, 
+        // on considère que tout est du capital
+        if ($totalRepaid <= $loan->requestAmount) {
+            $capitalRepaid = $totalRepaid;
+            $capitalRestant = $loan->requestAmount - $capitalRepaid;
+        } else {
+            // Si plus que le capital a été remboursé, le capital est entièrement remboursé
+            $capitalRepaid = $loan->requestAmount;
+            $capitalRestant = 0;
+        }
+        
+        // Date de remboursement
+        $repaymentDateCarbon = Carbon::parse($repaymentDate);
+        $loanStartDate = Carbon::parse($loan->submitDate);
+        
+        // Calculer les mois écoulés depuis le début du crédit
+        $monthsElapsed = $loanStartDate->diffInMonths($repaymentDateCarbon);
+        
+        // Intérêts dus jusqu'à la date de remboursement
+        $interetsDus = 0;
+        $interetsACanceler = 0;
+        $monthsToCancel = [];
+        
+        foreach ($schedule as $index => $installment) {
+            $installmentDate = Carbon::parse($installment['date']);
+            
+            // Si l'échéance est avant ou égale à la date de remboursement, les intérêts sont dus
+            if ($installmentDate->lte($repaymentDateCarbon)) {
+                $interetsDus += $installment['interet'];
+            } else {
+                // Si l'échéance est après la date de remboursement, annuler les intérêts
+                $interetsACanceler += $installment['interet'];
+                $monthsToCancel[] = [
+                    'month' => $installmentDate->format('Y-m'),
+                    'date' => $installmentDate->format('Y-m-d'),
+                    'interest' => round($installment['interet'], 2),
+                    'installment_index' => $index
+                ];
+            }
+        }
+        
+        // Intérêts déjà annulés (s'il y en a)
+        $totalCancelledInterest = $this->getCancelledInterest($loan->loanDocId);
+        
+        // Montant total à payer = Capital restant + Intérêts dus - Intérêts déjà annulés
+        $montantTotal = $capitalRestant + $interetsDus - $totalCancelledInterest;
+        
+        return [
+            'capitalRestant' => round($capitalRestant, 2),
+            'capitalRepaid' => round($capitalRepaid, 2),
+            'interetsDus' => round($interetsDus, 2),
+            'interetsACanceler' => round($interetsACanceler, 2),
+            'montantTotal' => round($montantTotal, 2),
+            'monthsToCancel' => $monthsToCancel,
+            'monthsElapsed' => $monthsElapsed,
+            'totalMonths' => $loan->loanMonths,
+            'isEarlyRepayment' => $monthsElapsed < $loan->loanMonths && $capitalRestant > 0
+        ];
+    }
+    
+    /**
      * Formater l'argent
      */
     public function formatMoney($amount)

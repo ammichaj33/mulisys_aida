@@ -44,6 +44,11 @@
                         <a href="{{ route('caissiere.repayments.create', ['loan_id' => $loan->loanDocId]) }}" class="btn btn-primary">
                             <i class="fas fa-money-bill-wave me-2"></i>Enregistrer remboursement
                         </a>
+                        @if($remainingAmount > 0)
+                        <a href="{{ route('caissiere.loans.early-repayment', $loan->loanDocId) }}" class="btn btn-warning">
+                            <i class="fas fa-clock me-2"></i>Remboursement anticipé
+                        </a>
+                        @endif
                     @endif
                 @endcan
                 @can('validate-credits')
@@ -281,6 +286,12 @@
                                class="btn btn-primary">
                                 <i class="fas fa-money-bill-wave me-2"></i>Enregistrer remboursement
                             </a>
+                            @if($remainingAmount > 0)
+                            <a href="{{ route('caissiere.loans.early-repayment', $loan->loanDocId) }}" 
+                               class="btn btn-warning">
+                                <i class="fas fa-clock me-2"></i>Remboursement anticipé
+                            </a>
+                            @endif
                             <a href="{{ route('caissiere.loans.schedule', $loan->loanDocId) }}" 
                                class="btn btn-outline-info">
                                 <i class="fas fa-calendar-alt me-2"></i>Calendrier de remboursement

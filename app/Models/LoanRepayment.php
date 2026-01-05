@@ -19,6 +19,7 @@ class LoanRepayment extends Model
         'repaymentDate',
         'repaymentTypeIdFk',
         'userIdFk',
+        'description',
     ];
 
     public function loanDoc()
