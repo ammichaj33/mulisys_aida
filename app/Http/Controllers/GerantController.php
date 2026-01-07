@@ -213,6 +213,9 @@ class GerantController extends Controller
         
         $loans = $query->orderBy('createdAt', 'desc')->paginate(20);
         
+        // Ajouter les paramètres de requête aux liens de pagination
+        $loans->appends($request->query());
+        
         // Statistiques
         $stats = [
             'total' => LoanDoc::count(),
