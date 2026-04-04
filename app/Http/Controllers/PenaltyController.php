@@ -144,7 +144,7 @@ class PenaltyController extends Controller
         }
         
         // Calculer les mois de retard
-        $toleranceDays = config('penalties.tolerance_days', 5);
+        $toleranceDays = config('penalties.tolerance_days', 30);
         $toleranceDate = $dueDate->copy()->addDays($toleranceDays);
         $currentDate = \Carbon\Carbon::now();
         
@@ -158,6 +158,56 @@ class PenaltyController extends Controller
                 }
             }
         }
+
+        // Vérifier si une pénalité notPaid existe pour le mois précédent
+        $previousMonth = $dueDate->copy()->subMonth()->format('Y-m');
+        $previousPenalty = \App\Models\Penalty::where('loanDocIdFk', $loan->loanDocId)
+            ->where('penaltyMonth', $previousMonth)
+            ->where('status', 'notPaid')
+            ->first();
+
+        // Calculer la pénalité avec la nouvelle formule
+        $penaltyRate = config('penalties.penalty_rate', 10.0);
+        $currentMonthCapital = $remainingCapitalAtDueDate;
+        $currentMonthInterest = $correspondingPayment['interet'];
+
+        $isConsecutive = $previousPenalty !== null;
+        $calculatedPenalty = 0;
+        $formula = '';
+
+        if ($isConsecutive && $monthsOverdue > 0) {
+            // Formule cumulée
+            $previousMonthIndex = null;
+            foreach ($interestCalculation['schedule'] as $idx => $schedulePayment) {
+                $scheduleDate = \Carbon\Carbon::parse($schedulePayment['date']);
+                if ($scheduleDate->format('Y-m') === $previousMonth) {
+                    $previousMonthIndex = $idx;
+                    break;
+                }
+            }
+
+            if ($previousMonthIndex !== null) {
+                $previousMonthPayment = $interestCalculation['schedule'][$previousMonthIndex];
+                $previousMonthCapital = $previousMonthPayment['capital_restant'];
+                $previousMonthInterest = $previousMonthPayment['interet'];
+                $previousPenaltyAmount = $previousPenalty->amount;
+
+                $calculatedPenalty = (($previousMonthCapital + $previousMonthInterest + $previousPenaltyAmount) 
+                                     + ($currentMonthCapital + $currentMonthInterest)) * ($penaltyRate / 100);
+                $formula = "(({$previousMonthCapital} + {$previousMonthInterest} + {$previousPenaltyAmount}) + ({$currentMonthCapital} + {$currentMonthInterest})) × {$penaltyRate}%";
+            } else {
+                // Si on ne trouve pas le mois précédent, utiliser la formule simple
+                $calculatedPenalty = ($currentMonthCapital + $currentMonthInterest) * ($penaltyRate / 100);
+                $formula = "({$currentMonthCapital} + {$currentMonthInterest}) × {$penaltyRate}%";
+                $isConsecutive = false;
+            }
+        }
+
+        if (!$isConsecutive || $calculatedPenalty == 0) {
+            // Formule simple (premier retard)
+            $calculatedPenalty = ($currentMonthCapital + $currentMonthInterest) * ($penaltyRate / 100);
+            $formula = "({$currentMonthCapital} + {$currentMonthInterest}) × {$penaltyRate}%";
+        }
         
         return [
             'due_date' => $dueDate,
@@ -165,8 +215,11 @@ class PenaltyController extends Controller
             'total_repaid_before_due' => $totalRepaidBeforeDue,
             'remaining_capital' => $remainingCapitalAtDueDate,
             'months_overdue' => $monthsOverdue,
-            'monthly_rate' => config('penalties.penalty_monthly_rate', 1.0),
-            'calculated_penalty' => $remainingCapitalAtDueDate * (config('penalties.penalty_monthly_rate', 1.0) / 100) * $monthsOverdue,
+            'penalty_rate' => $penaltyRate,
+            'calculated_penalty' => round($calculatedPenalty, 2),
+            'formula' => $formula,
+            'is_consecutive' => $isConsecutive,
+            'previous_penalty' => $previousPenalty,
             'corresponding_payment' => $correspondingPayment
         ];
     }

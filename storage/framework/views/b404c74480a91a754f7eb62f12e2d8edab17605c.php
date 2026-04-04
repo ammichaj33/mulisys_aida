@@ -1,17 +1,15 @@
-@extends('layouts.app')
+<?php $__env->startSection('title', 'Enregistrer un remboursement'); ?>
 
-@section('title', 'Enregistrer un remboursement')
-
-@section('content')
+<?php $__env->startSection('content'); ?>
 <div class="row">
     <div class="col-12">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <h2><i class="fas fa-money-bill-wave me-2"></i>Enregistrer un remboursement</h2>
             <div class="d-flex align-items-center gap-3">
                 <span class="badge bg-success fs-6">
-                    {{ $loans->count() }} crédit(s) validé(s)
+                    <?php echo e($loans->count()); ?> crédit(s) validé(s)
                 </span>
-                <a href="{{ route('caissiere.dashboard') }}" class="btn btn-outline-secondary">
+                <a href="<?php echo e(route('caissiere.dashboard')); ?>" class="btn btn-outline-secondary">
                     <i class="fas fa-arrow-left me-2"></i>Retour au dashboard
                 </a>
             </div>
@@ -29,17 +27,17 @@
     </div>
 </div>
 
-@if ($errors->any())
+<?php if($errors->any()): ?>
     <div class="alert alert-danger">
         <ul class="mb-0">
-            @foreach ($errors->all() as $error)
-                <li>{{ $error }}</li>
-            @endforeach
+            <?php $__currentLoopData = $errors->all(); $__env->addLoop($__currentLoopData); foreach($__currentLoopData as $error): $__env->incrementLoopIndices(); $loop = $__env->getLastLoop(); ?>
+                <li><?php echo e($error); ?></li>
+            <?php endforeach; $__env->popLoop(); $loop = $__env->getLastLoop(); ?>
         </ul>
     </div>
-@endif
+<?php endif; ?>
 
-@if($selectedLoan)
+<?php if($selectedLoan): ?>
     <!-- Formulaire de remboursement pour un crédit spécifique -->
     <div class="row">
         <div class="col-md-8">
@@ -48,29 +46,30 @@
                     <h5 class="mb-0">Enregistrer un remboursement</h5>
                 </div>
                 <div class="card-body">
-                    <form method="POST" action="{{ route('caissiere.repayments.store') }}">
-                        @csrf
-                        <input type="hidden" name="loanDocIdFk" value="{{ $selectedLoan->loanDocId }}">
+                    <form method="POST" action="<?php echo e(route('caissiere.repayments.store')); ?>">
+                        <?php echo csrf_field(); ?>
+                        <input type="hidden" name="loanDocIdFk" value="<?php echo e($selectedLoan->loanDocId); ?>">
 
                         <!-- Informations du crédit sélectionné -->
                         <div class="alert alert-info mb-4">
                             <i class="fas fa-info-circle me-2"></i>
                             <div class="d-flex align-items-center">
-                                @if($selectedLoan->member->photo)
-                                    <img src="{{ route('members.photo', $selectedLoan->member->memberId) }}" 
-                                         alt="Photo de {{ $selectedLoan->member->firstName }} {{ $selectedLoan->member->lastName }}" 
+                                <?php if($selectedLoan->member->photo): ?>
+                                    <img src="<?php echo e(route('members.photo', $selectedLoan->member->memberId)); ?>" 
+                                         alt="Photo de <?php echo e($selectedLoan->member->firstName); ?> <?php echo e($selectedLoan->member->lastName); ?>" 
                                          class="rounded-circle me-3" 
                                          style="width: 50px; height: 50px; object-fit: cover;">
-                                @else
+                                <?php else: ?>
                                     <div class="bg-light rounded-circle me-3 d-flex align-items-center justify-content-center" 
                                          style="width: 50px; height: 50px;">
                                         <i class="fas fa-user text-muted"></i>
                                     </div>
-                                @endif
+                                <?php endif; ?>
                                 <div>
                                     <strong>Crédit sélectionné :</strong> 
-                                    {{ $selectedLoan->refNumber }} - {{ $selectedLoan->member->firstName }} {{ $selectedLoan->member->lastName }}
-                                    ({{ round($selectedLoan->requestAmount, 2) }} USD)
+                                    <?php echo e($selectedLoan->refNumber); ?> - <?php echo e($selectedLoan->member->firstName); ?> <?php echo e($selectedLoan->member->lastName); ?>
+
+                                    (<?php echo e(round($selectedLoan->requestAmount, 2)); ?> USD)
                                 </div>
                             </div>
                         </div>
@@ -81,88 +80,89 @@
                             <div class="row">
                                 <div class="col-md-3">
                                     <strong>Montant total dû:</strong><br>
-                                    <span class="text-primary h6">{{ round($selectedLoan->totalAmountDue, 2) }} USD</span>
+                                    <span class="text-primary h6"><?php echo e(round($selectedLoan->totalAmountDue, 2)); ?> USD</span>
                                 </div>
                                 <div class="col-md-3">
                                     <strong>Déjà remboursé:</strong><br>
-                                    <span class="text-success h6">{{ round($selectedLoan->totalRepaid, 2) }} USD</span>
+                                    <span class="text-success h6"><?php echo e(round($selectedLoan->totalRepaid, 2)); ?> USD</span>
                                 </div>
                                 <div class="col-md-3">
                                     <strong>Reste dû:</strong><br>
-                                    <span class="text-warning h6">{{ round($selectedLoan->remainingAmount, 2) }} USD</span>
+                                    <span class="text-warning h6"><?php echo e(round($selectedLoan->remainingAmount, 2)); ?> USD</span>
                                 </div>
                                 <div class="col-md-3">
                                     <strong>Pénalités non payées:</strong><br>
-                                    <span class="text-danger h6">{{ round($selectedLoan->unpaidPenalties ?? 0, 2) }} USD</span>
+                                    <span class="text-danger h6"><?php echo e(round($selectedLoan->unpaidPenalties ?? 0, 2)); ?> USD</span>
                                 </div>
                             </div>
-                            @if(($selectedLoan->unpaidPenalties ?? 0) > 0)
+                            <?php if(($selectedLoan->unpaidPenalties ?? 0) > 0): ?>
                                 <div class="row mt-3">
                                     <div class="col-12">
                                         <div class="alert alert-warning mb-0">
                                             <i class="fas fa-exclamation-triangle me-2"></i>
                                             <strong>Pénalités en attente :</strong>
-                                            <span class="text-danger h5 fw-bold">{{ round($selectedLoan->unpaidPenalties ?? 0, 2) }} USD</span>
+                                            <span class="text-danger h5 fw-bold"><?php echo e(round($selectedLoan->unpaidPenalties ?? 0, 2)); ?> USD</span>
                                         </div>
                                     </div>
                                 </div>
-                            @else
+                            <?php else: ?>
                                 <div class="row mt-3">
                                     <div class="col-12">
                                         <div class="alert alert-success mb-0">
                                             <i class="fas fa-check-circle me-2"></i>
                                             <strong>Montant maximum autorisé :</strong>
-                                            <span class="text-primary h4 fw-bold">{{ round($selectedLoan->remainingAmount, 2) }} USD</span>
+                                            <span class="text-primary h4 fw-bold"><?php echo e(round($selectedLoan->remainingAmount, 2)); ?> USD</span>
                                         </div>
                                     </div>
                                 </div>
-                            @endif
+                            <?php endif; ?>
                         </div>
 
                         <div class="mb-3">
                             <label for="amount" class="form-label">Montant <span class="text-danger">*</span></label>
                             <div class="input-group">
-                                @php
+                                <?php
                                     // Montant maximum = Reste dû (hors pénalités)
                                     $maxAmount = $selectedLoan->remainingAmount;
-                                @endphp
+                                ?>
                                 <input type="number" step="0.01" class="form-control" id="amount" name="amount" 
-                                       value="{{ old('amount') }}" required 
-                                       placeholder="0.00" max="{{ round($maxAmount, 2) }}">
+                                       value="<?php echo e(old('amount')); ?>" required 
+                                       placeholder="0.00" max="<?php echo e(round($maxAmount, 2)); ?>">
                                 <span class="input-group-text">USD</span>
                             </div>
                             <div class="form-text">
                                 <i class="fas fa-info-circle me-1"></i>
-                                Montant maximum autorisé : <strong>{{ round($maxAmount, 2) }} USD</strong>
+                                Montant maximum autorisé : <strong><?php echo e(round($maxAmount, 2)); ?> USD</strong>
                             </div>
                         </div>
 
                         <div class="mb-3">
                             <label for="repaymentDate" class="form-label">Date de remboursement <span class="text-danger">*</span></label>
                             <input type="date" class="form-control" id="repaymentDate" name="repaymentDate" 
-                                   value="{{ old('repaymentDate', date('Y-m-d')) }}" required>
+                                   value="<?php echo e(old('repaymentDate', date('Y-m-d'))); ?>" required>
                         </div>
 
                         <div class="mb-3">
                             <label for="repaymentTypeIdFk" class="form-label">Type de remboursement <span class="text-danger">*</span></label>
                             <select class="form-select" id="repaymentTypeIdFk" name="repaymentTypeIdFk" required>
                                 <option value="">Sélectionner un type</option>
-                                @foreach($repaymentTypes as $type)
-                                    <option value="{{ $type->repaymentTypeID }}" {{ old('repaymentTypeIdFk') == $type->repaymentTypeID ? 'selected' : '' }}>
-                                        {{ $type->repaymentName }}
+                                <?php $__currentLoopData = $repaymentTypes; $__env->addLoop($__currentLoopData); foreach($__currentLoopData as $type): $__env->incrementLoopIndices(); $loop = $__env->getLastLoop(); ?>
+                                    <option value="<?php echo e($type->repaymentTypeID); ?>" <?php echo e(old('repaymentTypeIdFk') == $type->repaymentTypeID ? 'selected' : ''); ?>>
+                                        <?php echo e($type->repaymentName); ?>
+
                                     </option>
-                                @endforeach
+                                <?php endforeach; $__env->popLoop(); $loop = $__env->getLastLoop(); ?>
                             </select>
                         </div>
 
                         <div class="mb-3">
                             <label for="description" class="form-label">Description (optionnel)</label>
                             <textarea class="form-control" id="description" name="description" rows="2" 
-                                      placeholder="Notes sur ce remboursement...">{{ old('description') }}</textarea>
+                                      placeholder="Notes sur ce remboursement..."><?php echo e(old('description')); ?></textarea>
                         </div>
 
                         <div class="d-flex justify-content-end gap-2">
-                            <a href="{{ route('caissiere.repayments.index') }}" class="btn btn-outline-secondary">
+                            <a href="<?php echo e(route('caissiere.repayments.index')); ?>" class="btn btn-outline-secondary">
                                 <i class="fas fa-arrow-left me-2"></i>Retour à la liste
                             </a>
                             <button type="submit" class="btn btn-success">
@@ -194,20 +194,20 @@
             </div>
         </div>
     </div>
-@else
+<?php else: ?>
     <!-- Redirection vers la liste des crédits -->
     <script>
-        window.location.href = "{{ route('caissiere.repayments.index') }}";
+        window.location.href = "<?php echo e(route('caissiere.repayments.index')); ?>";
     </script>
-@endif
+<?php endif; ?>
 
-@push('scripts')
+<?php $__env->startPush('scripts'); ?>
 <script>
-@php
+<?php
     // Montant maximum pour JavaScript = reste dû (hors pénalités)
     $maxAmountForJS = $selectedLoan ? $selectedLoan->remainingAmount : 0;
-@endphp
-const maxRepaymentAmount = {{ round($maxAmountForJS, 2) }};
+?>
+const maxRepaymentAmount = <?php echo e(round($maxAmountForJS, 2)); ?>;
 
 function formatMoney(amount) {
     return Math.round(amount * 100) / 100;
@@ -251,6 +251,7 @@ document.getElementById('amount').addEventListener('input', function() {
     }
 });
 </script>
-@endpush
+<?php $__env->stopPush(); ?>
 
-@endsection
+<?php $__env->stopSection(); ?>
+<?php echo $__env->make('layouts.app', \Illuminate\Support\Arr::except(get_defined_vars(), ['__data', '__path']))->render(); ?><?php /**PATH C:\laragon\www\mulisys_aida\resources\views/caissiere/repayments/create.blade.php ENDPATH**/ ?>

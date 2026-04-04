@@ -162,11 +162,20 @@
                             @endforeach
                         </select>
                     </div>
-                    <div class="col-md-4">
+                    <div class="col-md-2">
                         <label for="search" class="form-label">Recherche</label>
                         <input type="text" class="form-control" id="search" name="search" 
                                value="{{ request('search') }}" 
                                placeholder="Référence, nom, téléphone...">
+                    </div>
+                    <div class="col-md-2">
+                        <label for="overdue" class="form-label">Insolvables</label>
+                        <div class="form-check mt-2">
+                            <input class="form-check-input" type="checkbox" value="1" id="overdue" name="overdue" {{ request('overdue') ? 'checked' : '' }}>
+                            <label class="form-check-label" for="overdue">
+                                Date prévue dépassée
+                            </label>
+                        </div>
                     </div>
                     <div class="col-md-4">
                         <label class="form-label">&nbsp;</label>

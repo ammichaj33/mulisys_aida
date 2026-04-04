@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Pagination\LengthAwarePaginator;
 use App\Models\LoanDoc;
 use App\Models\LoanRepayment;
 use App\Models\RepaymentType;
@@ -33,7 +34,8 @@ class CaissiereController extends Controller
     public function dashboard(Request $request)
     {
         // Tous les dossiers avec filtres
-        $loansQuery = LoanDoc::with('member');
+        $loansQuery = LoanDoc::with('member')
+            ->withSum('loanRepayments', 'amount');
 
         // Filtres
         if ($request->filled('status')) {
@@ -52,7 +54,109 @@ class CaissiereController extends Controller
             });
         }
 
-        $recentRequests = $loansQuery->orderBy('createdAt', 'desc')->paginate(20);
+        // Enrichir et filtrer
+        $calculationService = new LoanCalculationService();
+        if ($request->boolean('overdue')) {
+            // Charger l'ensemble des dossiers correspondant aux filtres, puis filtrer l'insolvabilité
+            $allLoans = $loansQuery->orderBy('createdAt', 'desc')->get();
+            $enriched = $allLoans->map(function($loan) use ($calculationService) {
+                $interestCalculation = $calculationService->calculateMonthlyDegressiveInterest(
+                    $loan->requestAmount,
+                    $loan->interestRate,
+                    $loan->loanMonths,
+                    $loan->submitDate->format('Y-m-d')
+                );
+                $totalCancelledInterest = $calculationService->getCancelledInterest($loan->loanDocId);
+                $loan->interestAmount = round($interestCalculation['total_interest'] - $totalCancelledInterest, 2);
+                $loan->totalAmountDue = round($loan->requestAmount + $interestCalculation['total_interest'] - $totalCancelledInterest, 2);
+                $loan->totalRepaid = round($loan->loan_repayments_sum_amount ?? 0, 2);
+                $loan->remainingAmount = max(0, round($loan->totalAmountDue - $loan->totalRepaid, 2));
+                $schedule = $interestCalculation['schedule'] ?? [];
+                if (!empty($schedule)) {
+                    $last = end($schedule);
+                    $loan->expectedEndDate = Carbon::parse($last['date']);
+                    reset($schedule);
+                } else {
+                    $loan->expectedEndDate = $loan->submitDate->copy()->addMonths((int)($loan->loanMonths ?? 0));
+                }
+                $loan->expectedToDate = 0.0;
+                $loan->actualToDate = (float) ($loan->loan_repayments_sum_amount ?? 0);
+                if (!empty($schedule)) {
+                    $repayments = $loan->loanRepayments()->orderBy('created_at', 'asc')->get(['amount', 'created_at']);
+                    $cumulativeBefore = 0.0;
+                    foreach ($schedule as $payment) {
+                        $dueDate = Carbon::parse($payment['date']);
+                        $expected = (float) ($payment['montant_total'] ?? 0);
+                        if ($expected <= 0) {
+                            continue;
+                        }
+                        if ($dueDate->lte(now())) {
+                            $loan->expectedToDate += $expected;
+                        }
+                        foreach ($repayments as $rep) {
+                            if (Carbon::parse($rep->created_at)->lt($dueDate)) {
+                                $cumulativeBefore += (float) $rep->amount;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                return $loan;
+            });
+            $filtered = $enriched->filter(function($loan) {
+                $shortfallToday = ($loan->actualToDate + 1e-6) < ($loan->expectedToDate ?? 0);
+                return ($loan->remainingAmount ?? 0) > 0
+                    && in_array($loan->status, ['validated', 'done'], true)
+                    && ($shortfallToday || $loan->expectedEndDate->isPast());
+            })->values();
+            $perPage = 50;
+            $currentPage = max(1, (int) request()->input('page', 1));
+            $total = $filtered->count();
+            $items = $filtered->forPage($currentPage, $perPage)->values();
+            $query = request()->query();
+            unset($query['page']);
+            $recentRequests = new LengthAwarePaginator($items, $total, $perPage, $currentPage, [
+                'path' => request()->url(),
+                'query' => $query,
+            ]);
+        } else {
+            $recentRequests = $loansQuery->orderBy('createdAt', 'desc')->paginate(50);
+            $recentRequests->getCollection()->transform(function($loan) use ($calculationService) {
+                $interestCalculation = $calculationService->calculateMonthlyDegressiveInterest(
+                    $loan->requestAmount,
+                    $loan->interestRate,
+                    $loan->loanMonths,
+                    $loan->submitDate->format('Y-m-d')
+                );
+                $totalCancelledInterest = $calculationService->getCancelledInterest($loan->loanDocId);
+                $loan->interestAmount = round($interestCalculation['total_interest'] - $totalCancelledInterest, 2);
+                $loan->totalAmountDue = round($loan->requestAmount + $interestCalculation['total_interest'] - $totalCancelledInterest, 2);
+                $loan->totalRepaid = round($loan->loan_repayments_sum_amount ?? 0, 2);
+                $loan->remainingAmount = max(0, round($loan->totalAmountDue - $loan->totalRepaid, 2));
+                $schedule = $interestCalculation['schedule'] ?? [];
+                if (!empty($schedule)) {
+                    $last = end($schedule);
+                    $loan->expectedEndDate = Carbon::parse($last['date']);
+                    reset($schedule);
+                } else {
+                    $loan->expectedEndDate = $loan->submitDate->copy()->addMonths((int)($loan->loanMonths ?? 0));
+                }
+                // Dû cumulé à aujourd'hui
+                $loan->expectedToDate = 0.0;
+                if (!empty($schedule)) {
+                    foreach ($schedule as $payment) {
+                        $dueDate = Carbon::parse($payment['date']);
+                        $expected = (float) ($payment['montant_total'] ?? 0);
+                        if ($expected > 0 && $dueDate->lte(now())) {
+                            $loan->expectedToDate += $expected;
+                        }
+                    }
+                }
+                $loan->actualToDate = (float) ($loan->loan_repayments_sum_amount ?? 0);
+                return $loan;
+            });
+        }
 
         // Derniers remboursements
         $repaymentsQuery = LoanRepayment::with(['loanDoc.member', 'repaymentType', 'user']);
@@ -104,8 +208,12 @@ class CaissiereController extends Controller
             ->selectRaw('COUNT(*) as count, COALESCE(SUM(amount), 0) as total')
             ->first();
 
-        // Remboursements de la semaine
-        $weekRepayments = LoanRepayment::where('repaymentDate', '>=', now()->subDays(7))
+        // Remboursements de la semaine (fenêtre: max(début du mois, aujourd'hui-6j) → aujourd'hui)
+        $weekStartWindow = now()->subDays(6)->startOfDay();
+        $monthStart = now()->startOfMonth();
+        $weekStart = $weekStartWindow->lt($monthStart) ? $monthStart : $weekStartWindow;
+        $weekEnd = now()->endOfDay();
+        $weekRepayments = LoanRepayment::whereBetween('repaymentDate', [$weekStart, $weekEnd])
             ->selectRaw('COUNT(*) as count, COALESCE(SUM(amount), 0) as total')
             ->first();
 
@@ -227,7 +335,7 @@ class CaissiereController extends Controller
     }
 
     /**
-     * Record a repayment.
+     * Record a repayment with automatic allocation: Interest → Penalties → Capital
      */
     public function recordRepayment(Request $request, $id)
     {
@@ -249,23 +357,30 @@ class CaissiereController extends Controller
                 ->withInput();
         }
 
+        // Description simple du remboursement (sans retrait automatique des pénalités)
+        // Toujours une chaîne non nulle pour éviter les erreurs SQL
+        $description = $request->description ?: '';
+
         $repayment = LoanRepayment::create([
             'amount' => $request->amount,
             'loanDocIdFk' => $loan->loanDocId,
             'repaymentDate' => $request->repaymentDate,
             'repaymentTypeIdFk' => $request->repaymentTypeIdFk,
-            'userIdFk' => Auth::id()
+            'userIdFk' => Auth::id(),
+            'description' => $description
         ]);
 
         // Enregistrer automatiquement dans le cashflow
         $cashflowService = new CashflowService();
         $cashflowService->recordRepayment($repayment, $loan);
 
-        // Log the operation
+        // Log the operation (sans détail de répartition pénalités/intérêts/capital)
+        $logDescription = 'Remboursement enregistré: ' . number_format($request->amount, 2) . ' USD';
+
         Historique::create([
             'recordIdFk' => $loan->loanDocId,
             'recordStatus' => 'repayment_recorded',
-            'operDescription' => 'Remboursement enregistré: ' . number_format($request->amount, 2) . ' USD',
+            'operDescription' => $logDescription,
             'userIdFk' => Auth::id()
         ]);
 
@@ -548,47 +663,57 @@ class CaissiereController extends Controller
         // // Le reste va au remboursement du crédit
         // $loanPayment = $repaymentAmount;
         
-        // ============================================
-        // NOUVELLE LOGIQUE : Remboursement direct sans gestion des pénalités
-        // ============================================
-        // Le montant saisi est directement appliqué au remboursement du crédit
-        // Les pénalités doivent être gérées séparément via le module de gestion des pénalités
-        // ============================================
-        
-        // Vérifier que le montant ne dépasse pas le reste dû
-        $tolerance = 0.001; // 0.1 centime de tolérance
-        if (($request->amount - $remainingAmount) > $tolerance) {
+        try {
+            // Vérifier que le montant ne dépasse pas le reste dû (hors pénalités)
+            $tolerance = 0.001; // 0.1 centime de tolérance
+            if (($request->amount - $remainingAmount) > $tolerance) {
+                return back()->withErrors([
+                    'amount' => 'Le montant du remboursement (' . round($request->amount, 2) . ' USD) ne peut pas dépasser le montant total dû (' . round($remainingAmount, 2) . ' USD).'
+                ])->withInput();
+            }
+            
+            // Limiter la description utilisateur à 100 caractères max
+            $userDescription = $request->description ? mb_substr($request->description, 0, 100) : '';
+            // Description finale (max 255 caractères au total), sans mention de pénalités automatiques
+            // Toujours une chaîne non nulle pour éviter les erreurs SQL
+            $description = $userDescription !== '' ? mb_substr($userDescription, 0, 255) : '';
+            
+            // Créer le remboursement
+            $repayment = LoanRepayment::create([
+                'amount' => $request->amount,
+                'loanDocIdFk' => $request->loanDocIdFk,
+                'repaymentDate' => $request->repaymentDate,
+                'repaymentTypeIdFk' => $request->repaymentTypeIdFk,
+                'userIdFk' => Auth::id(),
+                'description' => $description
+            ]);
+
+            // Enregistrer automatiquement dans le cashflow
+            $cashflowService = new CashflowService();
+            $cashflowService->recordRepayment($repayment, $loan);
+            
+            // Log the operation (sans détail de répartition pénalités/intérêts/capital)
+            $logDescription = 'Remboursement enregistré: ' . number_format($request->amount, 2) . ' USD';
+            
+            Historique::create([
+                'recordIdFk' => $request->loanDocIdFk,
+                'recordStatus' => 'repayment_recorded',
+                'operDescription' => $logDescription,
+                'userIdFk' => Auth::id()
+            ]);
+            
+        } catch (\Exception $e) {
+            \Log::error("Erreur lors de l'enregistrement du remboursement", [
+                'loanId' => $request->loanDocIdFk,
+                'amount' => $request->amount,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            
             return back()->withErrors([
-                'amount' => 'Le montant du remboursement (' . round($request->amount, 2) . ' USD) ne peut pas dépasser le reste dû (' . round($remainingAmount, 2) . ' USD)'
+                'error' => 'Une erreur est survenue lors de l\'enregistrement: ' . $e->getMessage()
             ])->withInput();
         }
-        
-        // Le montant saisi va directement au remboursement du crédit
-        $loanPayment = $request->amount;
-        
-        // Créer le remboursement
-        $repayment = LoanRepayment::create([
-            'amount' => $loanPayment,
-            'loanDocIdFk' => $request->loanDocIdFk,
-            'repaymentDate' => $request->repaymentDate,
-            'repaymentTypeIdFk' => $request->repaymentTypeIdFk,
-            'userIdFk' => Auth::id(),
-            'description' => $request->description
-        ]);
-
-        // Log the operation
-        $logDescription = 'Remboursement enregistré: ' . number_format($loanPayment, 2) . ' USD';
-        // Note: Les pénalités ne sont plus gérées automatiquement lors de l'enregistrement d'un remboursement
-        // if ($penaltyPayment > 0) {
-        //     $logDescription .= ' + Pénalités payées: ' . number_format($penaltyPayment, 2) . ' USD';
-        // }
-        
-        Historique::create([
-            'recordIdFk' => $request->loanDocIdFk,
-            'recordStatus' => 'repayment_recorded',
-            'operDescription' => $logDescription,
-            'userIdFk' => Auth::id()
-        ]);
 
         // Vérifier si le crédit est entièrement remboursé
         $newTotalRepaid = $totalRepaid + $request->amount;
@@ -998,9 +1123,9 @@ class CaissiereController extends Controller
                 ]);
             }
 
-            // Enregistrer dans le cashflow
+            // Enregistrer dans le cashflow (catégorie spécifique pour remboursement anticipé)
             $cashflowService = new CashflowService();
-            $cashflowService->recordRepayment($repayment, $loan);
+            $cashflowService->recordEarlyRepayment($repayment, $loan);
 
             // Marquer le crédit comme terminé
             $loan->update([

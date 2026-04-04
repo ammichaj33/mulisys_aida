@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Pagination\LengthAwarePaginator;
 use App\Models\LoanDoc;
 use App\Models\Member;
 use App\Models\Historique;
@@ -30,7 +31,8 @@ class GerantController extends Controller
      */
     public function dashboard(Request $request)
     {
-        $query = LoanDoc::with('member');
+        $query = LoanDoc::with('member')
+            ->withSum('loanRepayments', 'amount');
 
         // Filtres
         if ($request->filled('status')) {
@@ -49,7 +51,127 @@ class GerantController extends Controller
             });
         }
 
-        $recentRequests = $query->orderBy('createdAt', 'desc')->paginate(20);
+        $recentRequests = $query->orderBy('createdAt', 'desc')->paginate(50);
+
+        // Enrichir avec remboursé et reste dû
+        $calculationService = new LoanCalculationService();
+        $recentRequests->getCollection()->transform(function($loan) use ($calculationService) {
+            $interestCalculation = $calculationService->calculateMonthlyDegressiveInterest(
+                $loan->requestAmount,
+                $loan->interestRate,
+                $loan->loanMonths,
+                $loan->submitDate->format('Y-m-d')
+            );
+            $totalCancelledInterest = $calculationService->getCancelledInterest($loan->loanDocId);
+            $loan->interestAmount = round($interestCalculation['total_interest'] - $totalCancelledInterest, 2);
+            $loan->totalAmountDue = round($loan->requestAmount + $interestCalculation['total_interest'] - $totalCancelledInterest, 2);
+            $loan->totalRepaid = round($loan->loan_repayments_sum_amount ?? 0, 2);
+            $loan->remainingAmount = max(0, round($loan->totalAmountDue - $loan->totalRepaid, 2));
+            // Date de fin prévue basée sur la dernière échéance
+            $schedule = $interestCalculation['schedule'] ?? [];
+            if (!empty($schedule)) {
+                $last = end($schedule);
+                $loan->expectedEndDate = \Carbon\Carbon::parse($last['date']);
+                reset($schedule);
+            } else {
+                $loan->expectedEndDate = $loan->submitDate->copy()->addMonths((int)($loan->loanMonths ?? 0));
+            }
+            // Dû cumulé et payé cumulé à aujourd'hui
+            $loan->expectedToDate = 0.0;
+            $loan->actualToDate = (float) ($loan->loan_repayments_sum_amount ?? 0);
+            // Prochaine échéance impayée (informatif)
+            $loan->nextUnpaidDueDate = null;
+            if (!empty($schedule)) {
+                $repayments = $loan->loanRepayments()->orderBy('created_at', 'asc')->get(['amount', 'created_at']);
+                $cumulativeBefore = 0.0;
+                foreach ($schedule as $payment) {
+                    $dueDate = \Carbon\Carbon::parse($payment['date']);
+                    $expected = (float) ($payment['montant_total'] ?? 0);
+                    if ($expected <= 0) {
+                        continue;
+                    }
+                    if ($dueDate->lte(now())) {
+                        $loan->expectedToDate += $expected;
+                    }
+                    if ($loan->nextUnpaidDueDate === null) {
+                        foreach ($repayments as $rep) {
+                            if (\Carbon\Carbon::parse($rep->created_at)->lt($dueDate)) {
+                                $cumulativeBefore += (float) $rep->amount;
+                            } else {
+                                break;
+                            }
+                        }
+                        if ($dueDate->lte(now()) && ($cumulativeBefore + 1e-6) < $expected) {
+                            $loan->nextUnpaidDueDate = $dueDate;
+                        }
+                    }
+                }
+            }
+            return $loan;
+        });
+
+        // Filtre "insolvables"
+        if ($request->boolean('overdue')) {
+            // Recharger tous les dossiers correspondant aux filtres (toutes années) puis appliquer le filtre
+            $allLoans = $query->orderBy('createdAt', 'desc')->get();
+            $enriched = $allLoans->map(function($loan) use ($calculationService) {
+                $interestCalculation = $calculationService->calculateMonthlyDegressiveInterest(
+                    $loan->requestAmount,
+                    $loan->interestRate,
+                    $loan->loanMonths,
+                    $loan->submitDate->format('Y-m-d')
+                );
+                $totalCancelledInterest = $calculationService->getCancelledInterest($loan->loanDocId);
+                $loan->interestAmount = round($interestCalculation['total_interest'] - $totalCancelledInterest, 2);
+                $loan->totalAmountDue = round($loan->requestAmount + $interestCalculation['total_interest'] - $totalCancelledInterest, 2);
+                $loan->totalRepaid = round($loan->loan_repayments_sum_amount ?? 0, 2);
+                $loan->remainingAmount = max(0, round($loan->totalAmountDue - $loan->totalRepaid, 2));
+                $schedule = $interestCalculation['schedule'] ?? [];
+                if (!empty($schedule)) {
+                    $last = end($schedule);
+                    $loan->expectedEndDate = \Carbon\Carbon::parse($last['date']);
+                    reset($schedule);
+                } else {
+                    $loan->expectedEndDate = $loan->submitDate->copy()->addMonths((int)($loan->loanMonths ?? 0));
+                }
+                // Dû cumulé à aujourd'hui
+                $loan->expectedToDate = 0.0;
+                if (!empty($schedule)) {
+                    foreach ($schedule as $payment) {
+                        $dueDate = \Carbon\Carbon::parse($payment['date']);
+                        $expected = (float) ($payment['montant_total'] ?? 0);
+                        if ($expected > 0 && $dueDate->lte(now())) {
+                            $loan->expectedToDate += $expected;
+                        }
+                    }
+                }
+                $loan->actualToDate = (float) ($loan->loan_repayments_sum_amount ?? 0);
+                return $loan;
+            });
+
+            $filtered = $enriched->filter(function($loan) {
+                $shortfallToday = ($loan->actualToDate + 1e-6) < ($loan->expectedToDate ?? 0);
+                return ($loan->remainingAmount ?? 0) > 0
+                    && in_array($loan->status, ['validated', 'done'], true)
+                    && ($shortfallToday || $loan->expectedEndDate->isPast());
+            })->values();
+
+            // Re-paginate AFTER filtering to keep consistent page size
+            $perPage = 50;
+            $currentPage = max(1, (int) request()->input('page', 1));
+            $total = $filtered->count();
+            $items = $filtered->forPage($currentPage, $perPage)->values();
+            // Nettoyer la query des paramètres de pagination
+            $query = request()->query();
+            unset($query['page']);
+            $recentRequests = new LengthAwarePaginator(
+                $items,
+                $total,
+                $perPage,
+                $currentPage,
+                ['path' => request()->url(), 'query' => $query]
+            );
+        }
 
         // Statistiques
         try {
@@ -86,9 +208,13 @@ class GerantController extends Controller
             $pendingPenalties = (object)['count' => 0, 'total' => 0];
         }
 
-        // Remboursements de la semaine
+        // Remboursements de la semaine (fenêtre: max(début du mois, aujourd'hui-6j) → aujourd'hui)
         try {
-            $weekRepayments = LoanRepayment::where('repaymentDate', '>=', now()->subDays(7))
+            $weekStartWindow = now()->subDays(6)->startOfDay();
+            $monthStart = now()->startOfMonth();
+            $weekStart = $weekStartWindow->lt($monthStart) ? $monthStart : $weekStartWindow;
+            $weekEnd = now()->endOfDay();
+            $weekRepayments = LoanRepayment::whereBetween('repaymentDate', [$weekStart, $weekEnd])
                 ->selectRaw('COUNT(*) as count, COALESCE(SUM(amount), 0) as total')
                 ->first();
         } catch (\Exception $e) {

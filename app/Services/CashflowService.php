@@ -63,11 +63,42 @@ class CashflowService
      */
     public function recordRepayment($repayment, $loanDoc)
     {
-        // Trouver ou créer la catégorie "Remboursements de crédits"
+        // Charger le type de remboursement si pas déjà chargé
+        if (!$repayment->relationLoaded('repaymentType')) {
+            $repayment->load('repaymentType');
+        }
+
+        // Récupérer le nom du type de remboursement
+        $categoryName = 'Remboursements de crédits'; // Valeur par défaut
+        $categoryDescription = "Remboursements automatiques des crédits";
+        
+        if ($repayment->repaymentType) {
+            // Utiliser repaymentName si disponible, sinon repaymentType
+            $repaymentTypeName = $repayment->repaymentType->repaymentName 
+                ?? $repayment->repaymentType->repaymentType 
+                ?? null;
+            
+            if ($repaymentTypeName) {
+                $categoryName = $repaymentTypeName;
+                $categoryDescription = $repayment->repaymentType->description 
+                    ?? "Remboursements de type: {$categoryName}";
+            }
+        }
+
+        // Trouver ou créer la catégorie avec le nom du type de remboursement
         $category = CashflowCategory::firstOrCreate(
-            ['categoryName' => 'Remboursements de crédits', 'categoryType' => 'income'],
-            ['description' => 'Remboursements automatiques des crédits']
+            ['categoryName' => $categoryName, 'categoryType' => 'income'],
+            ['description' => $categoryDescription, 'isActive' => true]
         );
+
+        // S'assurer que la catégorie est active et mettre à jour la description si nécessaire
+        if (!$category->isActive) {
+            $category->isActive = true;
+        }
+        if ($category->description !== $categoryDescription) {
+            $category->description = $categoryDescription;
+        }
+        $category->save();
 
         return $this->recordTransaction([
             'transactionType' => 'income',
@@ -83,6 +114,61 @@ class CashflowService
     }
 
     /**
+     * Enregistrer un remboursement anticipé comme entrée (catégorie dédiée)
+     */
+    public function recordEarlyRepayment($repayment, $loanDoc)
+    {
+        // Charger le type de remboursement si pas déjà chargé
+        if (!$repayment->relationLoaded('repaymentType')) {
+            $repayment->load('repaymentType');
+        }
+
+        // Récupérer le nom du type de remboursement
+        $categoryName = 'Remboursements anticipés'; // Valeur par défaut
+        $categoryDescription = "Remboursements anticipés des crédits";
+        
+        if ($repayment->repaymentType) {
+            // Utiliser repaymentName si disponible, sinon repaymentType
+            $repaymentTypeName = $repayment->repaymentType->repaymentName 
+                ?? $repayment->repaymentType->repaymentType 
+                ?? null;
+            
+            if ($repaymentTypeName) {
+                $categoryName = $repaymentTypeName;
+                $categoryDescription = $repayment->repaymentType->description 
+                    ?? "Remboursements anticipés de type: {$categoryName}";
+            }
+        }
+
+        // Trouver ou créer la catégorie avec le nom du type de remboursement
+        $category = CashflowCategory::firstOrCreate(
+            ['categoryName' => $categoryName, 'categoryType' => 'income'],
+            ['description' => $categoryDescription, 'isActive' => true]
+        );
+
+        // S'assurer que la catégorie est active et mettre à jour la description si nécessaire
+        if (!$category->isActive) {
+            $category->isActive = true;
+        }
+        if ($category->description !== $categoryDescription) {
+            $category->description = $categoryDescription;
+        }
+        $category->save();
+
+        return $this->recordTransaction([
+            'transactionType' => 'income',
+            'categoryIdFk' => $category->categoryId,
+            'amount' => $repayment->amount,
+            'description' => "Remboursement anticipé pour le crédit {$loanDoc->refNumber}",
+            'paymentMethod' => 'cash',
+            'loanDocIdFk' => $loanDoc->loanDocId,
+            'memberIdFk' => $loanDoc->memberIdFk,
+            'transactionDate' => $repayment->repaymentDate->format('Y-m-d'),
+            'userIdFk' => $repayment->userIdFk,
+        ]);
+    }
+
+    /**
      * Enregistrer un octroi de crédit comme sortie
      */
     public function recordLoanGrant($loanDoc)
@@ -90,8 +176,14 @@ class CashflowService
         // Trouver ou créer la catégorie "Octroi de crédits"
         $category = CashflowCategory::firstOrCreate(
             ['categoryName' => 'Octroi de crédits', 'categoryType' => 'expense'],
-            ['description' => 'Octroi automatique des crédits validés']
+            ['description' => 'Octroi automatique des crédits validés', 'isActive' => true]
         );
+
+        // S'assurer que la catégorie est active
+        if (!$category->isActive) {
+            $category->isActive = true;
+            $category->save();
+        }
 
         return $this->recordTransaction([
             'transactionType' => 'expense',
@@ -113,8 +205,19 @@ class CashflowService
         // Trouver ou créer la catégorie "Pénalités collectées"
         $category = CashflowCategory::firstOrCreate(
             ['categoryName' => 'Pénalités collectées', 'categoryType' => 'income'],
-            ['description' => 'Pénalités payées par les membres']
+            ['description' => 'Pénalités payées par les membres', 'isActive' => true]
         );
+
+        // S'assurer que la catégorie est active
+        if (!$category->isActive) {
+            $category->isActive = true;
+            $category->save();
+        }
+
+        // Utiliser la date de paiement de la pénalité si disponible, sinon la date du jour
+        $transactionDate = $penalty->paidAt
+            ? $penalty->paidAt->format('Y-m-d')
+            : now()->toDateString();
 
         return $this->recordTransaction([
             'transactionType' => 'income',
@@ -124,7 +227,7 @@ class CashflowService
             'paymentMethod' => 'cash',
             'loanDocIdFk' => $loanDoc->loanDocId,
             'memberIdFk' => $loanDoc->memberIdFk,
-            'transactionDate' => now()->toDateString(),
+            'transactionDate' => $transactionDate,
         ]);
     }
 
