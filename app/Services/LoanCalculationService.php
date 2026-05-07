@@ -120,26 +120,6 @@ class LoanCalculationService
         
         $schedule = $interestCalculation['schedule'];
         
-        // Calculer le capital déjà remboursé
-        $totalRepaid = $loan->loanRepayments->sum('amount');
-        
-        // Calculer le capital restant (approximation : montant initial - remboursements)
-        // Note: Cette approche est simplifiée. En réalité, il faudrait calculer
-        // combien de capital a été remboursé vs intérêts dans chaque paiement
-        $capitalRepaid = 0;
-        $capitalRestant = $loan->requestAmount;
-        
-        // Approche simplifiée : si le total remboursé est inférieur au capital, 
-        // on considère que tout est du capital
-        if ($totalRepaid <= $loan->requestAmount) {
-            $capitalRepaid = $totalRepaid;
-            $capitalRestant = $loan->requestAmount - $capitalRepaid;
-        } else {
-            // Si plus que le capital a été remboursé, le capital est entièrement remboursé
-            $capitalRepaid = $loan->requestAmount;
-            $capitalRestant = 0;
-        }
-        
         // Date de remboursement
         $repaymentDateCarbon = Carbon::parse($repaymentDate);
         $loanStartDate = Carbon::parse($loan->submitDate);
@@ -147,34 +127,87 @@ class LoanCalculationService
         // Calculer les mois écoulés depuis le début du crédit
         $monthsElapsed = $loanStartDate->diffInMonths($repaymentDateCarbon);
         
-        // Intérêts dus jusqu'à la date de remboursement
-        $interetsDus = 0;
-        $interetsACanceler = 0;
+        // Remboursements pris en compte jusqu'à la date sélectionnée
+        $totalRepaidToDate = $loan->loanRepayments
+            ->filter(function ($r) use ($repaymentDateCarbon) {
+                return Carbon::parse($r->repaymentDate)->lte($repaymentDateCarbon);
+            })
+            ->sum('amount');
+
+        // Intérêts déjà annulés (s'il y en a) - par mois (Y-m)
+        $cancellations = InterestCancellation::where('loanDocIdFk', $loan->loanDocId)->get();
+        $cancelledByMonth = [];
+        foreach ($cancellations as $c) {
+            $m = (string) $c->cancelledMonth; // format Y-m
+            $cancelledByMonth[$m] = ($cancelledByMonth[$m] ?? 0) + (float) $c->cancelledInterestAmount;
+        }
+
+        // Total des intérêts/du capital "dus jusqu'à la date" selon l'échéancier
+        $dueInterestRaw = 0.0;
+        $dueCapitalRaw = 0.0;
+        $interetsACanceler = 0.0;
         $monthsToCancel = [];
-        
+
         foreach ($schedule as $index => $installment) {
             $installmentDate = Carbon::parse($installment['date']);
-            
-            // Si l'échéance est avant ou égale à la date de remboursement, les intérêts sont dus
+            $monthKey = $installmentDate->format('Y-m');
+
             if ($installmentDate->lte($repaymentDateCarbon)) {
-                $interetsDus += $installment['interet'];
+                $dueInterestRaw += (float) $installment['interet'];
+                $dueCapitalRaw += (float) $installment['rembfixe'];
             } else {
-                // Si l'échéance est après la date de remboursement, annuler les intérêts
-                $interetsACanceler += $installment['interet'];
-                $monthsToCancel[] = [
-                    'month' => $installmentDate->format('Y-m'),
-                    'date' => $installmentDate->format('Y-m-d'),
-                    'interest' => round($installment['interet'], 2),
-                    'installment_index' => $index
-                ];
+                // Intérêts futurs à annuler, en évitant de re-annuler ce qui l'a déjà été
+                $alreadyCancelled = (float) ($cancelledByMonth[$monthKey] ?? 0.0);
+                $interestToCancel = max(0.0, (float) $installment['interet'] - $alreadyCancelled);
+                if ($interestToCancel > 0) {
+                    $interetsACanceler += $interestToCancel;
+                    $monthsToCancel[] = [
+                        'month' => $monthKey,
+                        'date' => $installmentDate->format('Y-m-d'),
+                        'interest' => round($interestToCancel, 2),
+                        'installment_index' => $index
+                    ];
+                }
             }
         }
-        
-        // Intérêts déjà annulés (s'il y en a)
-        $totalCancelledInterest = $this->getCancelledInterest($loan->loanDocId);
-        
-        // Montant total à payer = Capital restant + Intérêts dus - Intérêts déjà annulés
-        $montantTotal = $capitalRestant + $interetsDus - $totalCancelledInterest;
+
+        // Intérêts annulés qui concernent des mois <= date de remboursement (ils ne sont plus dus)
+        $cancelledUpToDate = 0.0;
+        foreach ($cancelledByMonth as $monthKey => $amt) {
+            try {
+                $monthEnd = Carbon::createFromFormat('Y-m', $monthKey)->endOfMonth();
+                if ($monthEnd->lte($repaymentDateCarbon)) {
+                    $cancelledUpToDate += (float) $amt;
+                }
+            } catch (\Exception $e) {
+                // Ignorer les formats inattendus
+            }
+        }
+
+        $dueInterest = max(0.0, $dueInterestRaw - $cancelledUpToDate);
+        $dueCapital = max(0.0, $dueCapitalRaw);
+
+        // Allocation simplifiée des paiements: intérêts dus d'abord, ensuite capital dû,
+        // puis tout surplus réduit le capital restant (avance sur capital).
+        $paidToInterest = min($totalRepaidToDate, $dueInterest);
+        $remainingPaid = $totalRepaidToDate - $paidToInterest;
+
+        $paidToCapitalScheduled = min($remainingPaid, $dueCapital);
+        $remainingPaid -= $paidToCapitalScheduled;
+
+        $paidToCapitalExtra = max(0.0, $remainingPaid);
+
+        $interetsDus = max(0.0, $dueInterest - $paidToInterest);
+
+        $capitalRepaid = min(
+            (float) $loan->requestAmount,
+            (float) $paidToCapitalScheduled + (float) $paidToCapitalExtra
+        );
+
+        $capitalRestant = max(0.0, (float) $loan->requestAmount - (float) $capitalRepaid);
+
+        // Montant total à payer pour solder à la date = Capital restant + Intérêts dus jusqu'à la date
+        $montantTotal = max(0.0, (float) $capitalRestant + (float) $interetsDus);
         
         return [
             'capitalRestant' => round($capitalRestant, 2),
@@ -185,7 +218,7 @@ class LoanCalculationService
             'monthsToCancel' => $monthsToCancel,
             'monthsElapsed' => $monthsElapsed,
             'totalMonths' => $loan->loanMonths,
-            'isEarlyRepayment' => $monthsElapsed < $loan->loanMonths && $capitalRestant > 0
+            'isEarlyRepayment' => $monthsElapsed < $loan->loanMonths && $montantTotal > 0
         ];
     }
     

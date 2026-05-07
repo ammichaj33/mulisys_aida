@@ -34,6 +34,26 @@ class GerantController extends Controller
         $query = LoanDoc::with('member')
             ->withSum('loanRepayments', 'amount');
 
+        $overdueFrom = null;
+        $overdueTo = null;
+        if ($request->boolean('overdue')) {
+            // Filtre optionnel "insolvables du ... au ..." basé sur la date prévue (expectedEndDate)
+            try {
+                if ($request->filled('overdue_from')) {
+                    $overdueFrom = Carbon::parse($request->input('overdue_from'))->startOfDay();
+                }
+                if ($request->filled('overdue_to')) {
+                    $overdueTo = Carbon::parse($request->input('overdue_to'))->endOfDay();
+                }
+                if ($overdueFrom && $overdueTo && $overdueFrom->gt($overdueTo)) {
+                    [$overdueFrom, $overdueTo] = [$overdueTo->copy()->startOfDay(), $overdueFrom->copy()->endOfDay()];
+                }
+            } catch (\Exception $e) {
+                $overdueFrom = null;
+                $overdueTo = null;
+            }
+        }
+
         // Filtres
         if ($request->filled('status')) {
             $query->where('status', $request->status);
@@ -156,6 +176,22 @@ class GerantController extends Controller
                     && ($shortfallToday || $loan->expectedEndDate->isPast());
             })->values();
 
+            if ($overdueFrom || $overdueTo) {
+                $filtered = $filtered->filter(function ($loan) use ($overdueFrom, $overdueTo) {
+                    if (empty($loan->expectedEndDate)) {
+                        return false;
+                    }
+                    $d = $loan->expectedEndDate instanceof Carbon ? $loan->expectedEndDate : Carbon::parse($loan->expectedEndDate);
+                    if ($overdueFrom && $d->lt($overdueFrom)) {
+                        return false;
+                    }
+                    if ($overdueTo && $d->gt($overdueTo)) {
+                        return false;
+                    }
+                    return true;
+                })->values();
+            }
+
             // Re-paginate AFTER filtering to keep consistent page size
             $perPage = 50;
             $currentPage = max(1, (int) request()->input('page', 1));
@@ -232,6 +268,149 @@ class GerantController extends Controller
         }
 
         return view('gerant.dashboard', compact('recentRequests', 'stats', 'todayRepayments', 'pendingPenalties', 'weekRepayments', 'monthRepayments'));
+    }
+
+    public function printOverduePdf(Request $request)
+    {
+        if (!$request->boolean('overdue')) {
+            return redirect()->route('gerant.dashboard');
+        }
+
+        $query = LoanDoc::with('member')->withSum('loanRepayments', 'amount');
+
+        if ($request->filled('status')) {
+            $query->where('status', $request->status);
+        }
+
+        if ($request->filled('search')) {
+            $search = $request->search;
+            $query->where(function ($q) use ($search) {
+                $q->where('refNumber', 'like', "%{$search}%")
+                    ->orWhereHas('member', function ($memberQuery) use ($search) {
+                        $memberQuery->where('firstName', 'like', "%{$search}%")
+                            ->orWhere('lastName', 'like', "%{$search}%")
+                            ->orWhere('phoneNumber', 'like', "%{$search}%");
+                    });
+            });
+        }
+
+        $overdueFrom = null;
+        $overdueTo = null;
+        try {
+            if ($request->filled('overdue_from')) {
+                $overdueFrom = Carbon::parse($request->input('overdue_from'))->startOfDay();
+            }
+            if ($request->filled('overdue_to')) {
+                $overdueTo = Carbon::parse($request->input('overdue_to'))->endOfDay();
+            }
+            if ($overdueFrom && $overdueTo && $overdueFrom->gt($overdueTo)) {
+                [$overdueFrom, $overdueTo] = [$overdueTo->copy()->startOfDay(), $overdueFrom->copy()->endOfDay()];
+            }
+        } catch (\Exception $e) {
+            $overdueFrom = null;
+            $overdueTo = null;
+        }
+
+        $calculationService = new LoanCalculationService();
+        $allLoans = $query->orderBy('createdAt', 'desc')->get();
+
+        $enriched = $allLoans->map(function ($loan) use ($calculationService) {
+            $interestCalculation = $calculationService->calculateMonthlyDegressiveInterest(
+                $loan->requestAmount,
+                $loan->interestRate,
+                $loan->loanMonths,
+                $loan->submitDate->format('Y-m-d')
+            );
+            $totalCancelledInterest = $calculationService->getCancelledInterest($loan->loanDocId);
+            $loan->interestAmount = round($interestCalculation['total_interest'] - $totalCancelledInterest, 2);
+            $loan->totalAmountDue = round($loan->requestAmount + $interestCalculation['total_interest'] - $totalCancelledInterest, 2);
+            $loan->totalRepaid = round($loan->loan_repayments_sum_amount ?? 0, 2);
+            $loan->remainingAmount = max(0, round($loan->totalAmountDue - $loan->totalRepaid, 2));
+            $schedule = $interestCalculation['schedule'] ?? [];
+            if (!empty($schedule)) {
+                $last = end($schedule);
+                $loan->expectedEndDate = Carbon::parse($last['date']);
+                reset($schedule);
+            } else {
+                $loan->expectedEndDate = $loan->submitDate->copy()->addMonths((int)($loan->loanMonths ?? 0));
+            }
+            $loan->expectedToDate = 0.0;
+            $loan->actualToDate = (float)($loan->loan_repayments_sum_amount ?? 0);
+            if (!empty($schedule)) {
+                $repayments = $loan->loanRepayments()->orderBy('created_at', 'asc')->get(['amount', 'created_at']);
+                $cumulativeBefore = 0.0;
+                foreach ($schedule as $payment) {
+                    $dueDate = Carbon::parse($payment['date']);
+                    $expected = (float)($payment['montant_total'] ?? 0);
+                    if ($expected <= 0) {
+                        continue;
+                    }
+                    if ($dueDate->lte(now())) {
+                        $loan->expectedToDate += $expected;
+                    }
+                    foreach ($repayments as $rep) {
+                        if (Carbon::parse($rep->created_at)->lt($dueDate)) {
+                            $cumulativeBefore += (float)$rep->amount;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            return $loan;
+        });
+
+        $loans = $enriched->filter(function ($loan) use ($overdueFrom, $overdueTo) {
+            $shortfallToday = ($loan->actualToDate + 1e-6) < ($loan->expectedToDate ?? 0);
+            $isOverdue = ($loan->remainingAmount ?? 0) > 0
+                && in_array($loan->status, ['validated', 'done'], true)
+                && ($shortfallToday || $loan->expectedEndDate->isPast());
+
+            if (!$isOverdue) {
+                return false;
+            }
+
+            if ($overdueFrom || $overdueTo) {
+                if (empty($loan->expectedEndDate)) {
+                    return false;
+                }
+                $d = $loan->expectedEndDate instanceof Carbon ? $loan->expectedEndDate : Carbon::parse($loan->expectedEndDate);
+                if ($overdueFrom && $d->lt($overdueFrom)) {
+                    return false;
+                }
+                if ($overdueTo && $d->gt($overdueTo)) {
+                    return false;
+                }
+            }
+
+            return true;
+        })->values();
+
+        $loans = $loans->sortBy(function ($loan) {
+            return $loan->expectedEndDate ? $loan->expectedEndDate->timestamp : PHP_INT_MAX;
+        })->values();
+
+        $totals = [
+            'count' => $loans->count(),
+            'requestAmount' => round((float)$loans->sum('requestAmount'), 2),
+            'totalAmountDue' => round((float)$loans->sum('totalAmountDue'), 2),
+            'totalRepaid' => round((float)$loans->sum('totalRepaid'), 2),
+            'remainingAmount' => round((float)$loans->sum('remainingAmount'), 2),
+        ];
+
+        $pdf = \PDF::loadView('gerant.insolvables-pdf', [
+            'loans' => $loans,
+            'overdueFrom' => $overdueFrom,
+            'overdueTo' => $overdueTo,
+            'filters' => [
+                'status' => $request->input('status'),
+                'search' => $request->input('search'),
+            ],
+            'totals' => $totals,
+        ]);
+
+        $filename = 'insolvables_gerant_' . now()->format('Ymd_His') . '.pdf';
+        return $pdf->stream($filename);
     }
 
     /**

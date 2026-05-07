@@ -168,6 +168,9 @@
                                value="{{ request('search') }}" 
                                placeholder="Référence, nom, téléphone...">
                     </div>
+
+                    <div class="w-100"></div>
+
                     <div class="col-md-2">
                         <label for="overdue" class="form-label">Insolvables</label>
                         <div class="form-check mt-2">
@@ -177,12 +180,32 @@
                             </label>
                         </div>
                     </div>
+                    <div class="col-md-2">
+                        <label for="overdue_from" class="form-label">Du</label>
+                        <input type="date" class="form-control" id="overdue_from" name="overdue_from"
+                               value="{{ request('overdue_from') }}"
+                               @if(!request('overdue')) disabled @endif>
+                    </div>
+                    <div class="col-md-2">
+                        <label for="overdue_to" class="form-label">Au</label>
+                        <input type="date" class="form-control" id="overdue_to" name="overdue_to"
+                               value="{{ request('overdue_to') }}"
+                               @if(!request('overdue')) disabled @endif>
+                    </div>
+
+                    <div class="w-100"></div>
+
                     <div class="col-md-4">
                         <label class="form-label">&nbsp;</label>
                         <div class="d-flex gap-2">
                             <button type="submit" class="btn btn-primary">
                                 <i class="fas fa-search me-2"></i>Filtrer
                             </button>
+                            @if(request('overdue'))
+                                <a href="{{ route('gerant.dashboard.insolvables.pdf', request()->query()) }}" target="_blank" class="btn btn-outline-dark">
+                                    <i class="fas fa-print me-2"></i>Imprimer
+                                </a>
+                            @endif
                             <a href="{{ route('gerant.dashboard') }}" class="btn btn-outline-secondary">
                                 <i class="fas fa-times me-2"></i>Effacer
                             </a>
@@ -193,6 +216,26 @@
         </div>
     </div>
 </div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    const overdue = document.getElementById('overdue');
+    const from = document.getElementById('overdue_from');
+    const to = document.getElementById('overdue_to');
+    if (!overdue || !from || !to) return;
+    const sync = () => {
+        const enabled = overdue.checked;
+        from.disabled = !enabled;
+        to.disabled = !enabled;
+        if (!enabled) {
+            from.value = '';
+            to.value = '';
+        }
+    };
+    overdue.addEventListener('change', sync);
+    sync();
+});
+</script>
 
 <div class="row">
     <div class="col-12">

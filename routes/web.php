@@ -62,6 +62,7 @@ Route::middleware(['auth'])->group(function () {
     // Routes du gérant
     Route::prefix('gerant')->name('gerant.')->middleware('permission:view-dashboard-gerant')->group(function () {
         Route::get('/dashboard', [GerantController::class, 'dashboard'])->name('dashboard');
+        Route::get('/dashboard/insolvables/pdf', [GerantController::class, 'printOverduePdf'])->name('dashboard.insolvables.pdf');
         Route::match(['get', 'post'], '/final-validation', [GerantController::class, 'finalValidation'])->name('final-validation')->middleware('permission:view-final-validation');
         Route::get('/loans', [GerantController::class, 'index'])->name('loans.index')->middleware('permission:view-loan-requests');
         Route::get('/loans/{id}', [GerantController::class, 'show'])->name('loans.show')->middleware('permission:view-loan-requests');
@@ -77,6 +78,7 @@ Route::middleware(['auth'])->group(function () {
     // Routes de la caissière
     Route::prefix('caissiere')->name('caissiere.')->middleware('permission:view-dashboard-caissiere')->group(function () {
         Route::get('/dashboard', [CaissiereController::class, 'dashboard'])->name('dashboard');
+        Route::get('/dashboard/insolvables/pdf', [CaissiereController::class, 'printOverduePdf'])->name('dashboard.insolvables.pdf');
         Route::get('/loans/{id}', [CaissiereController::class, 'show'])->name('loans.show')->middleware('permission:view-repayments');
         Route::get('/loans/{id}/schedule', [CaissiereController::class, 'schedule'])->name('loans.schedule')->middleware('permission:view-repayment-schedule');
         Route::get('/loans/{id}/early-repayment', [CaissiereController::class, 'earlyRepaymentForm'])->name('loans.early-repayment')->middleware('permission:create-repayments');
