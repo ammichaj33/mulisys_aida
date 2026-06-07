@@ -200,7 +200,7 @@ class CashflowService
     /**
      * Enregistrer une pénalité payée comme entrée
      */
-    public function recordPenaltyPayment($penalty, $loanDoc)
+    public function recordPenaltyPayment($penalty, $loanDoc, $transactionAmount = null, $transactionDate = null)
     {
         // Trouver ou créer la catégorie "Pénalités collectées"
         $category = CashflowCategory::firstOrCreate(
@@ -214,20 +214,21 @@ class CashflowService
             $category->save();
         }
 
-        // Utiliser la date de paiement de la pénalité si disponible, sinon la date du jour
-        $transactionDate = $penalty->paidAt
-            ? $penalty->paidAt->format('Y-m-d')
-            : now()->toDateString();
+        $resolvedDate = $transactionDate
+            ? (\Carbon\Carbon::parse($transactionDate)->format('Y-m-d'))
+            : ($penalty->paidAt
+                ? $penalty->paidAt->format('Y-m-d')
+                : now()->toDateString());
 
         return $this->recordTransaction([
             'transactionType' => 'income',
             'categoryIdFk' => $category->categoryId,
-            'amount' => $penalty->paidAmount ?? $penalty->amount,
+            'amount' => $transactionAmount ?? $penalty->paidAmount ?? $penalty->amount,
             'description' => "Pénalité payée pour le crédit {$loanDoc->refNumber}",
             'paymentMethod' => 'cash',
             'loanDocIdFk' => $loanDoc->loanDocId,
             'memberIdFk' => $loanDoc->memberIdFk,
-            'transactionDate' => $transactionDate,
+            'transactionDate' => $resolvedDate,
         ]);
     }
 

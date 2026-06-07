@@ -70,158 +70,9 @@ class PenaltyController extends Controller
     {
         $penalty = Penalty::with(['loanDoc.member', 'loanDoc.loanRepayments'])->findOrFail($id);
         
-        // Calculer les détails de la pénalité pour affichage
-        $penaltyDetails = $this->calculatePenaltyDetails($penalty);
+        $penaltyDetails = $this->penaltyService->getPenaltyDetailsForDisplay($penalty);
         
         return view('penalties.show', compact('penalty', 'penaltyDetails'));
-    }
-    
-    /**
-     * Calculate penalty details for display
-     */
-    private function calculatePenaltyDetails($penalty)
-    {
-        $loan = $penalty->loanDoc;
-        $calculationService = new \App\Services\LoanCalculationService();
-        
-        // Calculer le calendrier de remboursement
-        $interestCalculation = $calculationService->calculateMonthlyDegressiveInterest(
-            $loan->requestAmount,
-            $loan->interestRate,
-            $loan->loanMonths,
-            $loan->submitDate->format('Y-m-d')
-        );
-        
-        // Trouver l'échéance correspondant à cette pénalité
-        $penaltyMonth = $penalty->penaltyMonth;
-        $correspondingPayment = null;
-        
-        foreach ($interestCalculation['schedule'] as $payment) {
-            $paymentDate = \Carbon\Carbon::parse($payment['date']);
-            if ($paymentDate->format('Y-m') === $penaltyMonth) {
-                $correspondingPayment = $payment;
-                break;
-            }
-        }
-        
-        if (!$correspondingPayment) {
-            return null;
-        }
-        
-        // Calculer le capital restant dû à cette échéance
-        $dueDate = \Carbon\Carbon::parse($correspondingPayment['date']);
-        $repayments = $loan->loanRepayments()->orderBy('created_at', 'asc')->get();
-        
-        $totalRepaidBeforeDue = 0;
-        foreach ($repayments as $repayment) {
-            $repaymentDate = \Carbon\Carbon::parse($repayment->created_at);
-            if ($repaymentDate->lt($dueDate)) {
-                $totalRepaidBeforeDue += $repayment->amount;
-            }
-        }
-        
-        $expectedAmountAtDueDate = $correspondingPayment['montant_total'];
-        $remainingCapitalAtDueDate = $correspondingPayment['capital_restant'];
-        
-        // Si des paiements partiels ont été effectués
-        if ($totalRepaidBeforeDue > 0) {
-            $totalExpectedBeforeDue = 0;
-            $totalCapitalExpectedBeforeDue = 0;
-            
-            foreach ($interestCalculation['schedule'] as $schedulePayment) {
-                $scheduleDate = \Carbon\Carbon::parse($schedulePayment['date']);
-                if ($scheduleDate->lt($dueDate)) {
-                    $totalExpectedBeforeDue += $schedulePayment['montant_total'];
-                    $totalCapitalExpectedBeforeDue += $schedulePayment['remboursement_fixe'];
-                }
-            }
-            
-            if ($totalExpectedBeforeDue > 0) {
-                $capitalRepaidProportion = $totalRepaidBeforeDue / $totalExpectedBeforeDue;
-                $capitalRepaid = $capitalRepaidProportion * $totalCapitalExpectedBeforeDue;
-                $remainingCapitalAtDueDate = max(0, $correspondingPayment['capital_restant'] - $capitalRepaid);
-            }
-        }
-        
-        // Calculer les mois de retard
-        $toleranceDays = config('penalties.tolerance_days', 30);
-        $toleranceDate = $dueDate->copy()->addDays($toleranceDays);
-        $currentDate = \Carbon\Carbon::now();
-        
-        $monthsOverdue = 0;
-        if ($currentDate->gt($toleranceDate)) {
-            $monthsOverdue = $toleranceDate->diffInMonths($currentDate);
-            if ($monthsOverdue == 0) {
-                $daysOverdue = $toleranceDate->diffInDays($currentDate);
-                if ($daysOverdue >= 15) {
-                    $monthsOverdue = 1;
-                }
-            }
-        }
-
-        // Vérifier si une pénalité notPaid existe pour le mois précédent
-        $previousMonth = $dueDate->copy()->subMonth()->format('Y-m');
-        $previousPenalty = \App\Models\Penalty::where('loanDocIdFk', $loan->loanDocId)
-            ->where('penaltyMonth', $previousMonth)
-            ->where('status', 'notPaid')
-            ->first();
-
-        // Calculer la pénalité avec la nouvelle formule
-        $penaltyRate = config('penalties.penalty_rate', 10.0);
-        $currentMonthCapital = $remainingCapitalAtDueDate;
-        $currentMonthInterest = $correspondingPayment['interet'];
-
-        $isConsecutive = $previousPenalty !== null;
-        $calculatedPenalty = 0;
-        $formula = '';
-
-        if ($isConsecutive && $monthsOverdue > 0) {
-            // Formule cumulée
-            $previousMonthIndex = null;
-            foreach ($interestCalculation['schedule'] as $idx => $schedulePayment) {
-                $scheduleDate = \Carbon\Carbon::parse($schedulePayment['date']);
-                if ($scheduleDate->format('Y-m') === $previousMonth) {
-                    $previousMonthIndex = $idx;
-                    break;
-                }
-            }
-
-            if ($previousMonthIndex !== null) {
-                $previousMonthPayment = $interestCalculation['schedule'][$previousMonthIndex];
-                $previousMonthCapital = $previousMonthPayment['capital_restant'];
-                $previousMonthInterest = $previousMonthPayment['interet'];
-                $previousPenaltyAmount = $previousPenalty->amount;
-
-                $calculatedPenalty = (($previousMonthCapital + $previousMonthInterest + $previousPenaltyAmount) 
-                                     + ($currentMonthCapital + $currentMonthInterest)) * ($penaltyRate / 100);
-                $formula = "(({$previousMonthCapital} + {$previousMonthInterest} + {$previousPenaltyAmount}) + ({$currentMonthCapital} + {$currentMonthInterest})) × {$penaltyRate}%";
-            } else {
-                // Si on ne trouve pas le mois précédent, utiliser la formule simple
-                $calculatedPenalty = ($currentMonthCapital + $currentMonthInterest) * ($penaltyRate / 100);
-                $formula = "({$currentMonthCapital} + {$currentMonthInterest}) × {$penaltyRate}%";
-                $isConsecutive = false;
-            }
-        }
-
-        if (!$isConsecutive || $calculatedPenalty == 0) {
-            // Formule simple (premier retard)
-            $calculatedPenalty = ($currentMonthCapital + $currentMonthInterest) * ($penaltyRate / 100);
-            $formula = "({$currentMonthCapital} + {$currentMonthInterest}) × {$penaltyRate}%";
-        }
-        
-        return [
-            'due_date' => $dueDate,
-            'expected_amount' => $expectedAmountAtDueDate,
-            'total_repaid_before_due' => $totalRepaidBeforeDue,
-            'remaining_capital' => $remainingCapitalAtDueDate,
-            'months_overdue' => $monthsOverdue,
-            'penalty_rate' => $penaltyRate,
-            'calculated_penalty' => round($calculatedPenalty, 2),
-            'formula' => $formula,
-            'is_consecutive' => $isConsecutive,
-            'previous_penalty' => $previousPenalty,
-            'corresponding_payment' => $correspondingPayment
-        ];
     }
 
     /**
@@ -229,49 +80,123 @@ class PenaltyController extends Controller
      */
     public function pay(Request $request, $id)
     {
+        $penalty = Penalty::findOrFail($id);
+
         $request->validate([
-            'amount' => 'required|numeric|min:0.01',
+            'amount' => 'required|numeric|min:0.01|max:' . $penalty->amount,
             'payment_date' => 'required|date',
         ]);
-
-        $penalty = Penalty::findOrFail($id);
 
         if ($penalty->status === 'paid') {
             return back()->with('error', 'Cette pénalité a déjà été payée.');
         }
 
-        $success = $this->penaltyService->payPenalty($id, $request->amount);
+        try {
+            $result = $this->penaltyService->payPenalty(
+                $id,
+                $request->amount,
+                $request->payment_date
+            );
 
-        if ($success) {
-            return back()->with('success', 'Pénalité payée avec succès.');
+            if (!empty($result['success'])) {
+                if (!empty($result['fully_paid'])) {
+                    return back()->with('success', 'Pénalité payée intégralement.');
+                }
+
+                return back()->with('success', 'Paiement partiel enregistré. Reste à payer : '
+                    . number_format($result['remaining'], 2) . ' USD');
+            }
+
+            return back()->with('error', 'Erreur lors du paiement de la pénalité.');
+        } catch (\Exception $e) {
+            \Log::error('Erreur paiement pénalité', [
+                'penaltyId' => $id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return back()->with('error', 'Erreur lors du paiement : ' . $e->getMessage());
         }
-
-        return back()->with('error', 'Erreur lors du paiement de la pénalité.');
     }
 
     /**
-     * Calculate penalties for a specific loan
+     * Calculate penalties for a specific loan (create missing notPaid only)
      */
     public function calculateForLoan($loanId)
     {
         $loan = LoanDoc::with(['member', 'loanRepayments'])->findOrFail($loanId);
-        
         $penaltyAmount = $this->penaltyService->calculateLoanPenalty($loan);
 
-        if ($penaltyAmount > 0) {
-            return back()->with('success', 'Pénalités calculées: ' . number_format($penaltyAmount, 2) . ' USD');
-        }
-
-        return back()->with('info', 'Aucune pénalité à calculer pour ce crédit.');
+        return $this->penaltyActionResponse(
+            $penaltyAmount > 0
+                ? 'Pénalités calculées: ' . number_format($penaltyAmount, 2) . ' USD'
+                : 'Aucune nouvelle pénalité à calculer pour ce crédit.',
+            $penaltyAmount > 0 ? 'success' : 'info'
+        );
     }
 
     /**
-     * Calculate all penalties
+     * Calculate all penalties (create missing notPaid only)
      */
     public function calculateAll()
     {
         $totalPenalties = $this->penaltyService->calculateAllPenalties();
-        
-        return back()->with('success', "Pénalités calculées pour {$totalPenalties} crédits.");
+
+        return $this->penaltyActionResponse(
+            "Pénalités calculées pour {$totalPenalties} crédit(s).",
+            'success'
+        );
+    }
+
+    /**
+     * Recalculate penalties for a specific loan (create or update notPaid)
+     */
+    public function recalculateForLoan($loanId)
+    {
+        $loan = LoanDoc::with(['member', 'loanRepayments'])->findOrFail($loanId);
+        $result = $this->penaltyService->recalculateLoanPenalties($loan);
+
+        return $this->penaltyActionResponse($this->formatRecalculateMessage($result));
+    }
+
+    /**
+     * Recalculate all penalties (create or update notPaid)
+     */
+    public function recalculateAll()
+    {
+        $result = $this->penaltyService->recalculateAllPenalties();
+
+        return $this->penaltyActionResponse($this->formatRecalculateMessage($result));
+    }
+
+    private function formatRecalculateMessage(array $result): string
+    {
+        if ($result['created'] === 0 && $result['updated'] === 0) {
+            return 'Aucune pénalité à recalculer.';
+        }
+
+        $message = 'Recalcul terminé : '
+            . $result['created'] . ' créée(s), '
+            . $result['updated'] . ' mise(s) à jour, '
+            . 'total ' . number_format($result['total_amount'], 2) . ' USD';
+
+        if (isset($result['loans'])) {
+            $message .= ' sur ' . $result['loans'] . ' crédit(s).';
+        } else {
+            $message .= '.';
+        }
+
+        return $message;
+    }
+
+    private function penaltyActionResponse(string $message, string $flashType = 'success')
+    {
+        if (request()->expectsJson()) {
+            return response()->json([
+                'success' => $flashType !== 'error',
+                'message' => $message,
+            ]);
+        }
+
+        return back()->with($flashType, $message);
     }
 }

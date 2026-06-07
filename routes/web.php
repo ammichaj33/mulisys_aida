@@ -140,7 +140,9 @@ Route::middleware(['auth'])->group(function () {
         Route::get('/{id}', [App\Http\Controllers\PenaltyController::class, 'show'])->name('show')->middleware('permission:view-penalties');
         Route::post('/{id}/pay', [App\Http\Controllers\PenaltyController::class, 'pay'])->name('pay')->middleware('permission:pay-penalties');
         Route::post('/calculate-all', [App\Http\Controllers\PenaltyController::class, 'calculateAll'])->name('calculate-all')->middleware('permission:create-penalties');
+        Route::post('/recalculate-all', [App\Http\Controllers\PenaltyController::class, 'recalculateAll'])->name('recalculate-all')->middleware('permission:create-penalties');
         Route::post('/loan/{id}/calculate', [App\Http\Controllers\PenaltyController::class, 'calculateForLoan'])->name('calculate-loan')->middleware('permission:create-penalties');
+        Route::post('/loan/{id}/recalculate', [App\Http\Controllers\PenaltyController::class, 'recalculateForLoan'])->name('recalculate-loan')->middleware('permission:create-penalties');
     });
     
     // Routes des rapports (accessibles à tous avec permissions spécifiques)

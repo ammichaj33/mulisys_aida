@@ -15,38 +15,88 @@ class PenaltyCalculationService
      */
     public function calculateAllPenalties()
     {
+        $summary = $this->recalculateAllPenalties(false);
+
+        return $summary['loans'];
+    }
+
+    /**
+     * Recalculate penalties for all eligible loans (create or update notPaid records).
+     */
+    public function recalculateAllPenalties(bool $updateExisting = true): array
+    {
         $loans = LoanDoc::whereIn('status', ['validated', 'done'])
             ->with(['loanRepayments', 'member'])
             ->get();
 
-        $totalPenalties = 0;
+        $summary = [
+            'loans' => 0,
+            'created' => 0,
+            'updated' => 0,
+            'total_amount' => 0,
+        ];
 
         foreach ($loans as $loan) {
-            $penalty = $this->calculateLoanPenalty($loan);
-            if ($penalty > 0) {
-                $totalPenalties++;
+            $result = $this->processLoanPenalties($loan, $updateExisting);
+
+            if ($result['created'] > 0 || $result['updated'] > 0) {
+                $summary['loans']++;
             }
+
+            $summary['created'] += $result['created'];
+            $summary['updated'] += $result['updated'];
+            $summary['total_amount'] += $result['total_amount'];
         }
 
-        return $totalPenalties;
+        $summary['total_amount'] = round($summary['total_amount'], 2);
+
+        return $summary;
     }
 
     /**
-     * Calculate penalty for a specific loan with new rules:
-     * - First delay: (Capital + Interest) × 10%
-     * - Consecutive delay: ((Capital M-1 + Interest M-1 + Penalty M-1) + (Capital M + Interest M)) × 10%
+     * Recalculate penalties for a single loan (create or update notPaid records).
+     */
+    public function recalculateLoanPenalties(LoanDoc $loan): array
+    {
+        return $this->processLoanPenalties($loan, true);
+    }
+
+    /**
+     * Calculate penalty for a specific loan with rules:
+     * - M-1 : (Capital M-1 + Intérêt M-1) × 10%
+     * - M-2 : (Reste M-1 + Capital M-2 + Intérêt M-2) × 10%
+     * - M-3 : (Reste M-1 + Reste M-2 + Capital M-3 + Intérêt M-3) × 10%
+     * - etc.
+     *   Reste M-x = échéance M-x impayée + pénalité M-x impayée
+     *   Seuls les remboursements effectués pendant la tolérance de M-n (échéance + 30 jours) réduisent le Reste M-x.
      */
     public function calculateLoanPenalty(LoanDoc $loan)
     {
-        $toleranceDays = config('penalties.tolerance_days', 30);
-        $penaltyRate = config('penalties.penalty_rate', 10.0); // Taux fixe de 10%
+        $result = $this->processLoanPenalties($loan, false);
 
-        // Si le crédit n'est pas validé, pas de pénalité
+        return $result['total_amount'];
+    }
+
+    /**
+     * Process penalties for a loan.
+     *
+     * @param  bool  $updateExisting  When true, update existing notPaid penalties with recalculated amounts.
+     */
+    private function processLoanPenalties(LoanDoc $loan, bool $updateExisting): array
+    {
+        $summary = [
+            'created' => 0,
+            'updated' => 0,
+            'total_amount' => 0,
+        ];
+
         if ($loan->status !== 'validated') {
-            return 0;
+            return $summary;
         }
 
-        // Calculer les échéances mensuelles
+        $toleranceDays = config('penalties.tolerance_days', 30);
+        $penaltyRate = config('penalties.penalty_rate', 10.0);
+
         $calculationService = new LoanCalculationService();
         $interestCalculation = $calculationService->calculateMonthlyDegressiveInterest(
             $loan->requestAmount,
@@ -55,34 +105,20 @@ class PenaltyCalculationService
             $loan->submitDate->format('Y-m-d')
         );
 
-        // Récupérer tous les remboursements triés par date
-        $repayments = $loan->loanRepayments()->orderBy('created_at', 'asc')->get();
-
-        $totalPenalty = 0;
+        $repayments = $loan->loanRepayments()->orderBy('repaymentDate', 'asc')->orderBy('created_at', 'asc')->get();
         $currentDate = Carbon::now();
 
-        // Vérifier chaque échéance individuellement
         foreach ($interestCalculation['schedule'] as $index => $payment) {
-            $dueDate = Carbon::parse($payment['date']);
+            $dueDate = LoanCalculationService::normalizeYear(Carbon::parse($payment['date']));
 
-            // Si l'échéance n'est pas encore arrivée, pas de pénalité
             if ($dueDate->isFuture()) {
                 continue;
             }
 
-            // Calculer le montant dû à cette échéance spécifique
-            $expectedAmountAtDueDate = $payment['montant_total'];
-
-            // Calculer le montant réellement remboursé AVANT cette échéance
-            $actualRepaidBeforeDueDate = $this->calculateActualRepaidBeforeDate($repayments, $dueDate);
-
-            // Si le remboursement est insuffisant pour cette échéance
-            if ($actualRepaidBeforeDueDate < $expectedAmountAtDueDate) {
-                // Calculer les mois de retard (au-delà de la tolérance)
+            if ($this->isInstallmentUnpaid($index, $interestCalculation['schedule'], $repayments)) {
                 $monthsOverdue = $this->calculateMonthsOverdue($dueDate, $currentDate, $toleranceDays);
 
                 if ($monthsOverdue > 0) {
-                    // Calculer la pénalité avec la nouvelle formule
                     $penaltyAmount = $this->calculatePenaltyForMonth(
                         $index,
                         $payment,
@@ -94,85 +130,366 @@ class PenaltyCalculationService
                     );
 
                     if ($penaltyAmount > 0) {
-                        // Vérifier si une pénalité existe déjà pour cette échéance
+                        $penaltyMonth = $dueDate->format('Y-m');
+                        $description = $this->generatePenaltyDescription(
+                            $index,
+                            $dueDate,
+                            $penaltyAmount,
+                            $loan,
+                            $interestCalculation['schedule'],
+                            $repayments
+                        );
+
                         $existingPenalty = Penalty::where('loanDocIdFk', $loan->loanDocId)
-                            ->where('penaltyMonth', $dueDate->format('Y-m'))
+                            ->where('penaltyMonth', $penaltyMonth)
                             ->where('status', 'notPaid')
                             ->first();
 
-                        if (!$existingPenalty) {
-                            // Créer la pénalité
-                            $penalty = Penalty::create([
+                        if ($existingPenalty) {
+                            if ($updateExisting) {
+                                $existingPenalty->update([
+                                    'amount' => round($penaltyAmount, 2),
+                                    'description' => $description,
+                                ]);
+
+                                Historique::create([
+                                    'recordIdFk' => $loan->loanDocId,
+                                    'recordStatus' => 'penalty_recalculated',
+                                    'operDescription' => 'Pénalité recalculée: ' . number_format($penaltyAmount, 2) . ' USD pour échéance ' . ($index + 1),
+                                    'userIdFk' => Auth::id() ?? 1,
+                                ]);
+
+                                $summary['updated']++;
+                                $summary['total_amount'] += $penaltyAmount;
+                            }
+                        } else {
+                            Penalty::create([
                                 'loanDocIdFk' => $loan->loanDocId,
                                 'memberIdFk' => $loan->memberIdFk,
-                                'penaltyMonth' => $dueDate->format('Y-m'),
+                                'penaltyMonth' => $penaltyMonth,
                                 'amount' => round($penaltyAmount, 2),
                                 'reason' => 'retard',
-                                'description' => $this->generatePenaltyDescription($index, $dueDate, $penaltyAmount, $loan, $interestCalculation['schedule']),
+                                'description' => $description,
                                 'status' => 'notPaid',
                                 'created_at' => now(),
-                                'createdBy' => Auth::id() ?? 1
+                                'createdBy' => Auth::id() ?? 1,
                             ]);
 
-                            // Logger l'opération
                             Historique::create([
                                 'recordIdFk' => $loan->loanDocId,
                                 'recordStatus' => 'penalty_created',
                                 'operDescription' => 'Pénalité créée: ' . number_format($penaltyAmount, 2) . ' USD pour échéance ' . ($index + 1),
-                                'userIdFk' => Auth::id() ?? 1
+                                'userIdFk' => Auth::id() ?? 1,
                             ]);
 
-                            $totalPenalty += $penaltyAmount;
+                            $summary['created']++;
+                            $summary['total_amount'] += $penaltyAmount;
                         }
                     }
                 }
             }
         }
 
-        return round($totalPenalty, 2);
+        $summary['total_amount'] = round($summary['total_amount'], 2);
+
+        return $summary;
     }
 
     /**
-     * Calculate penalty for a specific month with new rules
+     * Calculate penalty for a specific month.
      */
     private function calculatePenaltyForMonth($index, $currentPayment, $dueDate, $loan, $schedule, $repayments, $penaltyRate)
     {
-        // Récupérer les données du mois actuel
-        $currentMonthCapital = $currentPayment['capital_restant'];
-        $currentMonthInterest = $currentPayment['interet'];
+        $details = $this->buildPenaltyCalculationDetails(
+            $loan->loanDocId,
+            $index,
+            $currentPayment,
+            $dueDate,
+            $schedule,
+            $repayments,
+            $penaltyRate
+        );
+
         $currentMonth = $dueDate->format('Y-m');
+        $logType = $details['is_consecutive'] ? 'cumulée (reste M-1)' : 'simple';
+        \Log::info("Pénalité {$logType} pour {$currentMonth}: {$details['formula']} = {$details['calculated_penalty']}");
 
-        // Vérifier si une pénalité notPaid existe pour le mois précédent
-        $previousMonth = Carbon::parse($dueDate)->subMonth()->format('Y-m');
-        $previousPenalty = $this->getUnpaidPenaltyForMonth($loan->loanDocId, $previousMonth);
+        return $details['calculated_penalty'];
+    }
 
-        if ($previousPenalty) {
-            // Formule cumulée : ((Capital M-1 + Intérêt M-1 + Pénalité M-1) + (Capital M + Intérêt M)) × 10%
-            $previousMonthPayment = null;
-            if ($index > 0) {
-                $previousMonthPayment = $schedule[$index - 1];
-            }
+    /**
+     * Part capital de l'échéance (amortissement mensuel, pas le capital restant global).
+     */
+    private function getInstallmentCapitalAmount(array $payment): float
+    {
+        return (float) ($payment['remboursement_fixe'] ?? $payment['rembfixe'] ?? 0);
+    }
 
-            if ($previousMonthPayment) {
-                $previousMonthCapital = $previousMonthPayment['capital_restant'];
-                $previousMonthInterest = $previousMonthPayment['interet'];
-                $previousPenaltyAmount = $previousPenalty->amount;
+    /**
+     * Build penalty calculation details for a given installment.
+     */
+    private function buildPenaltyCalculationDetails($loanId, $index, $currentPayment, $dueDate, $schedule, $repayments, $penaltyRate)
+    {
+        $currentMonthCapital = $this->getInstallmentCapitalAmount($currentPayment);
+        $currentMonthInterest = $currentPayment['interet'];
+        $currentMonthBase = $currentMonthCapital + $currentMonthInterest;
 
-                $penaltyAmount = (($previousMonthCapital + $previousMonthInterest + $previousPenaltyAmount) 
-                                 + ($currentMonthCapital + $currentMonthInterest)) * ($penaltyRate / 100);
+        $installmentNumber = $index + 1;
+        $toleranceDays = (int) config('penalties.tolerance_days', 30);
+        $previousRemaining = $this->calculatePreviousMonthsRemaining(
+            $loanId,
+            $index,
+            $schedule,
+            $repayments,
+            $dueDate,
+            $toleranceDays
+        );
+        $isConsecutive = $previousRemaining['total'] > 0;
 
-                \Log::info("Pénalité cumulée pour {$currentMonth}: (({$previousMonthCapital} + {$previousMonthInterest} + {$previousPenaltyAmount}) + ({$currentMonthCapital} + {$currentMonthInterest})) × {$penaltyRate}% = {$penaltyAmount}");
+        if ($isConsecutive) {
+            $baseAmount = $previousRemaining['total'] + $currentMonthBase;
+        } else {
+            $baseAmount = $currentMonthBase;
+        }
 
-                return round($penaltyAmount, 2);
+        $formulas = $this->buildPenaltyFormulaStrings(
+            $installmentNumber,
+            $currentMonthCapital,
+            $currentMonthInterest,
+            $previousRemaining,
+            $penaltyRate
+        );
+
+        $calculatedPenalty = round($baseAmount * ($penaltyRate / 100), 2);
+
+        return [
+            'current_month_capital' => round($currentMonthCapital, 2),
+            'current_month_interest' => round($currentMonthInterest, 2),
+            'previous_remaining' => $previousRemaining,
+            'is_consecutive' => $isConsecutive,
+            'penalty_rate' => $penaltyRate,
+            'calculated_penalty' => $calculatedPenalty,
+            'formula' => $formulas['numeric'],
+            'formula_labelled' => $formulas['labelled'],
+        ];
+    }
+
+    /**
+     * Build numeric and labelled formula strings.
+     */
+    private function buildPenaltyFormulaStrings($installmentNumber, $capital, $interest, array $previousRemaining, $penaltyRate): array
+    {
+        if ($installmentNumber === 1 || $previousRemaining['total'] <= 0) {
+            $numeric = '(' . number_format($capital, 2, '.', '')
+                . ' + ' . number_format($interest, 2, '.', '') . ') × ' . $penaltyRate . '%';
+            $labelled = '(Capital M-1 + Intérêt M-1) × ' . $penaltyRate . '%';
+
+            return ['numeric' => $numeric, 'labelled' => $labelled];
+        }
+
+        $numericParts = [];
+        $labelledParts = [];
+
+        foreach ($previousRemaining['breakdown'] as $month) {
+            $numericParts[] = number_format($month['subtotal'], 2, '.', '');
+            $labelledParts[] = 'Reste M-' . $month['installment_number'];
+        }
+
+        $numericParts[] = number_format($capital, 2, '.', '');
+        $numericParts[] = number_format($interest, 2, '.', '');
+        $labelledParts[] = 'Capital M-' . $installmentNumber;
+        $labelledParts[] = 'Intérêt M-' . $installmentNumber;
+
+        return [
+            'numeric' => '(' . implode(' + ', $numericParts) . ') × ' . $penaltyRate . '%',
+            'labelled' => '(' . implode(' + ', $labelledParts) . ') × ' . $penaltyRate . '%',
+        ];
+    }
+
+    /**
+     * Date effective d'un remboursement (date de paiement saisie par la caissière).
+     */
+    private function getRepaymentEffectiveDate($repayment): Carbon
+    {
+        if (!empty($repayment->repaymentDate)) {
+            return LoanCalculationService::normalizeYear(Carbon::parse($repayment->repaymentDate))->startOfDay();
+        }
+
+        return LoanCalculationService::normalizeYear(Carbon::parse($repayment->created_at))->startOfDay();
+    }
+
+    /**
+     * Fin de la période de tolérance pour une échéance.
+     */
+    private function getToleranceEndDate(Carbon $dueDate, int $toleranceDays): Carbon
+    {
+        return $dueDate->copy()->addDays($toleranceDays);
+    }
+
+    /**
+     * Total remboursé pendant la tolérance de M-n (du jour de l'échéance jusqu'à échéance + tolérance).
+     */
+    private function getTotalRepaidUpToToleranceEnd($repayments, Carbon $dueDate, int $toleranceDays): float
+    {
+        $cutoff = $this->getToleranceEndDate($dueDate, $toleranceDays)->endOfDay();
+        $total = 0;
+
+        foreach ($repayments as $repayment) {
+            if ($this->getRepaymentEffectiveDate($repayment)->lte($cutoff)) {
+                $total += (float) $repayment->amount;
             }
         }
 
-        // Formule simple (premier retard) : (Capital M + Intérêt M) × 10%
-        $penaltyAmount = ($currentMonthCapital + $currentMonthInterest) * ($penaltyRate / 100);
+        return round($total, 2);
+    }
 
-        \Log::info("Pénalité simple pour {$currentMonth}: ({$currentMonthCapital} + {$currentMonthInterest}) × {$penaltyRate}% = {$penaltyAmount}");
+    /**
+     * Reste M-x for all previous months (M-1 through M-(n-1)):
+     * échéance impayée + pénalité impayée, comptés à la fin de la tolérance de M-n.
+     */
+    private function calculatePreviousMonthsRemaining($loanId, $index, $schedule, $repayments, Carbon $dueDate, int $toleranceDays)
+    {
+        $toleranceEndDate = $this->getToleranceEndDate($dueDate, $toleranceDays);
 
-        return round($penaltyAmount, 2);
+        if ($index <= 0) {
+            return [
+                'total' => 0,
+                'installment_remaining' => 0,
+                'penalty_remaining' => 0,
+                'breakdown' => [],
+                'repaid_before_due' => 0,
+                'due_date' => $dueDate,
+                'tolerance_end_date' => $toleranceEndDate,
+            ];
+        }
+
+        $totalRepaid = $this->getTotalRepaidUpToToleranceEnd($repayments, $dueDate, $toleranceDays);
+        $remainingPayment = $totalRepaid;
+        $installmentRemaining = 0;
+        $penaltyRemaining = 0;
+        $breakdown = [];
+
+        for ($i = 0; $i < $index; $i++) {
+            $expected = $schedule[$i]['montant_total'];
+            $applied = min($remainingPayment, $expected);
+            $monthInstallmentRemaining = max(0, round($expected - $applied, 2));
+            $remainingPayment -= $applied;
+
+            $dueDate = LoanCalculationService::normalizeYear(Carbon::parse($schedule[$i]['date']));
+            $monthKey = $dueDate->format('Y-m');
+            $monthPenalty = $this->getUnpaidPenaltyForMonth($loanId, $monthKey);
+            $monthPenaltyRemaining = $monthPenalty ? round((float) $monthPenalty->amount, 2) : 0;
+
+            $subtotal = round($monthInstallmentRemaining + $monthPenaltyRemaining, 2);
+            $installmentRemaining += $monthInstallmentRemaining;
+            $penaltyRemaining += $monthPenaltyRemaining;
+
+            $breakdown[] = [
+                'installment_number' => $i + 1,
+                'label' => 'Reste M-' . ($i + 1),
+                'month' => $monthKey,
+                'due_date' => $dueDate,
+                'installment_remaining' => $monthInstallmentRemaining,
+                'penalty_remaining' => $monthPenaltyRemaining,
+                'subtotal' => $subtotal,
+            ];
+        }
+
+        return [
+            'total' => round($installmentRemaining + $penaltyRemaining, 2),
+            'installment_remaining' => round($installmentRemaining, 2),
+            'penalty_remaining' => round($penaltyRemaining, 2),
+            'breakdown' => $breakdown,
+            'repaid_before_due' => $totalRepaid,
+            'due_date' => $dueDate,
+            'tolerance_end_date' => $toleranceEndDate,
+        ];
+    }
+
+    /**
+     * Get penalty calculation details for display (PenaltyController / views).
+     */
+    public function getPenaltyDetailsForDisplay(Penalty $penalty): ?array
+    {
+        $loan = $penalty->loanDoc;
+        if (!$loan) {
+            return null;
+        }
+
+        $calculationService = new LoanCalculationService();
+        $interestCalculation = $calculationService->calculateMonthlyDegressiveInterest(
+            $loan->requestAmount,
+            $loan->interestRate,
+            $loan->loanMonths,
+            $loan->submitDate->format('Y-m-d')
+        );
+
+        $schedule = $interestCalculation['schedule'];
+        $penaltyMonth = $penalty->penaltyMonth;
+        $index = null;
+        $correspondingPayment = null;
+
+        foreach ($schedule as $idx => $payment) {
+            $paymentDate = LoanCalculationService::normalizeYear(Carbon::parse($payment['date']));
+            if ($paymentDate->format('Y-m') === $penaltyMonth || $this->normalizePenaltyMonth($penaltyMonth) === $paymentDate->format('Y-m')) {
+                $index = $idx;
+                $correspondingPayment = $payment;
+                break;
+            }
+        }
+
+        if ($index === null || !$correspondingPayment) {
+            return null;
+        }
+
+        $dueDate = LoanCalculationService::normalizeYear(Carbon::parse($correspondingPayment['date']));
+        $repayments = $loan->loanRepayments()->orderBy('repaymentDate', 'asc')->orderBy('created_at', 'asc')->get();
+        $penaltyRate = config('penalties.penalty_rate', 10.0);
+        $toleranceDays = config('penalties.tolerance_days', 30);
+
+        $toleranceEndDate = $this->getToleranceEndDate($dueDate, $toleranceDays);
+        $totalRepaidBeforeDue = $this->getTotalRepaidUpToToleranceEnd($repayments, $dueDate, $toleranceDays);
+        $monthsOverdue = $this->calculateMonthsOverdue($dueDate, Carbon::now(), $toleranceDays);
+
+        $calculation = $this->buildPenaltyCalculationDetails(
+            $loan->loanDocId,
+            $index,
+            $correspondingPayment,
+            $dueDate,
+            $schedule,
+            $repayments,
+            $penaltyRate
+        );
+
+        return array_merge($calculation, [
+            'installment_number' => $index + 1,
+            'due_date' => $dueDate,
+            'tolerance_end_date' => $toleranceEndDate,
+            'expected_amount' => round($correspondingPayment['montant_total'], 2),
+            'total_repaid_before_due' => round($totalRepaidBeforeDue, 2),
+            'total_repaid' => round($repayments->sum('amount'), 2),
+            'remaining_capital' => $calculation['current_month_capital'],
+            'months_overdue' => $monthsOverdue,
+            'corresponding_payment' => $correspondingPayment,
+            'previous_breakdown' => $calculation['previous_remaining']['breakdown'] ?? [],
+        ]);
+    }
+
+    /**
+     * Normalize stored penalty month (ex: 0026-09 -> 2026-09).
+     */
+    private function normalizePenaltyMonth(?string $month): ?string
+    {
+        if (!$month || !preg_match('/^(\d{2,4})-(\d{2})$/', $month, $matches)) {
+            return $month;
+        }
+
+        $year = (int) $matches[1];
+        if ($year < 100) {
+            $year += 2000;
+        }
+
+        return $year . '-' . $matches[2];
     }
 
     /**
@@ -189,16 +506,86 @@ class PenaltyCalculationService
     /**
      * Generate penalty description
      */
-    private function generatePenaltyDescription($index, $dueDate, $penaltyAmount, $loan, $schedule)
+    private function generatePenaltyDescription($index, $dueDate, $penaltyAmount, $loan, $schedule, $repayments)
     {
-        $previousMonth = Carbon::parse($dueDate)->subMonth()->format('Y-m');
-        $previousPenalty = $this->getUnpaidPenaltyForMonth($loan->loanDocId, $previousMonth);
+        $toleranceDays = (int) config('penalties.tolerance_days', 30);
+        $previousRemaining = $this->calculatePreviousMonthsRemaining(
+            $loan->loanDocId,
+            $index,
+            $schedule,
+            $repayments,
+            $dueDate,
+            $toleranceDays
+        );
+        $installmentNumber = $index + 1;
+        $dueDateLabel = $dueDate->format('d/m/Y');
+        $toleranceEndLabel = $previousRemaining['tolerance_end_date']->format('d/m/Y');
+        $amountLabel = number_format($penaltyAmount, 2, '.', '') . ' USD';
 
-        if ($previousPenalty) {
-            return "Retard consécutif - Échéance " . ($index + 1) . " ({$dueDate->format('d/m/Y')}) - Formule cumulée - Montant: " . number_format($penaltyAmount, 2) . " USD";
-        } else {
-            return "Premier retard - Échéance " . ($index + 1) . " ({$dueDate->format('d/m/Y')}) - Formule simple - Montant: " . number_format($penaltyAmount, 2) . " USD";
+        if ($previousRemaining['total'] > 0) {
+            $capital = $this->getInstallmentCapitalAmount($schedule[$index]);
+            $interest = $schedule[$index]['interet'];
+            $formulas = $this->buildPenaltyFormulaStrings(
+                $installmentNumber,
+                $capital,
+                $interest,
+                $previousRemaining,
+                config('penalties.penalty_rate', 10.0)
+            );
+
+            $lines = [
+                "Pénalité M-{$installmentNumber} — échéance du {$dueDateLabel}.",
+                'Remboursements pris en compte : pendant la tolérance (jusqu\'au ' . $toleranceEndLabel . ')'
+                    . ' = ' . number_format($previousRemaining['repaid_before_due'], 2) . ' USD.',
+                'Formule : ' . $formulas['labelled'],
+            ];
+
+            foreach ($previousRemaining['breakdown'] as $month) {
+                if ($month['subtotal'] <= 0) {
+                    continue;
+                }
+                $lines[] = '  • ' . $month['label'] . ' : '
+                    . number_format($month['installment_remaining'], 2) . ' USD (échéance)'
+                    . ' + ' . number_format($month['penalty_remaining'], 2) . ' USD (pénalité)'
+                    . ' = ' . number_format($month['subtotal'], 2) . ' USD';
+            }
+
+            $lines[] = '  • Capital M-' . $installmentNumber . ' : ' . number_format($capital, 2) . ' USD';
+            $lines[] = '  • Intérêt M-' . $installmentNumber . ' : ' . number_format($interest, 2) . ' USD';
+            $lines[] = "Pénalité M-{$installmentNumber} : {$amountLabel}.";
+
+            return implode("\n", $lines);
         }
+
+        return "Pénalité M-1 — échéance du {$dueDateLabel}."
+            . "\nFormule : (Capital M-1 + Intérêt M-1) × 10%"
+            . "\nPénalité M-1 : {$amountLabel}.";
+    }
+
+    /**
+     * Check if an installment is still unpaid using chronological allocation.
+     */
+    private function isInstallmentUnpaid($index, $schedule, $repayments): bool
+    {
+        $totalRepaid = 0;
+        foreach ($repayments as $repayment) {
+            $totalRepaid += $repayment->amount;
+        }
+
+        $remainingPayment = $totalRepaid;
+
+        for ($i = 0; $i <= $index; $i++) {
+            $expected = $schedule[$i]['montant_total'];
+            $applied = min($remainingPayment, $expected);
+
+            if ($i === $index) {
+                return $applied < $expected;
+            }
+
+            $remainingPayment -= $applied;
+        }
+
+        return false;
     }
 
     /**
@@ -275,26 +662,14 @@ class PenaltyCalculationService
      */
     private function calculateMonthsOverdue($dueDate, $currentDate, $toleranceDays)
     {
-        // Ajouter la tolérance à la date d'échéance
         $toleranceDate = $dueDate->copy()->addDays($toleranceDays);
 
-        // Si on est encore dans la période de tolérance, pas de retard
         if ($currentDate->lte($toleranceDate)) {
             return 0;
         }
 
-        // Calculer la différence en mois
-        $monthsOverdue = $toleranceDate->diffInMonths($currentDate);
-
-        // Si c'est exactement un mois, vérifier les jours
-        if ($monthsOverdue == 0) {
-            $daysOverdue = $toleranceDate->diffInDays($currentDate);
-            if ($daysOverdue >= 15) { // Si plus de 15 jours, compter comme 1 mois
-                return 1;
-            }
-        }
-
-        return $monthsOverdue;
+        // Dès le lendemain de la tolérance, l'échéance est pénalisable (une pénalité par mois d'échéance).
+        return max(1, $toleranceDate->diffInMonths($currentDate));
     }
 
     /**
@@ -361,34 +736,76 @@ class PenaltyCalculationService
     /**
      * Pay a penalty
      */
-    public function payPenalty($penaltyId, $amount = null)
+    public function payPenalty($penaltyId, $amount = null, $paymentDate = null)
     {
         $penalty = Penalty::findOrFail($penaltyId);
 
         if ($penalty->status === 'paid') {
-            return false;
+            return ['success' => false];
         }
 
-        $penalty->update([
-            'status' => 'paid',
-            'paidAt' => now(),
-            'paidAmount' => $amount ?? $penalty->amount
-        ]);
+        $paymentAmount = round((float) ($amount ?? $penalty->amount), 2);
+        $remainingDue = round((float) $penalty->amount, 2);
 
-        // Enregistrer automatiquement dans le cashflow
+        if ($paymentAmount <= 0) {
+            throw new \InvalidArgumentException('Le montant doit être supérieur à 0.');
+        }
+
+        if ($paymentAmount - $remainingDue > 0.01) {
+            throw new \InvalidArgumentException(
+                'Le montant payé (' . number_format($paymentAmount, 2) . ' USD) ne peut pas dépasser le reste dû (' . number_format($remainingDue, 2) . ' USD).'
+            );
+        }
+
+        $paidAt = $paymentDate
+            ? LoanCalculationService::normalizeYear(Carbon::parse($paymentDate))->setTimeFrom(now())
+            : now();
+
+        $totalPaidSoFar = round((float) ($penalty->paidAmount ?? 0) + $paymentAmount, 2);
+        $newRemaining = round($remainingDue - $paymentAmount, 2);
+        $isFullyPaid = $newRemaining <= 0.01;
+
         $loan = LoanDoc::findOrFail($penalty->loanDocIdFk);
         $cashflowService = new \App\Services\CashflowService();
-        $cashflowService->recordPenaltyPayment($penalty, $loan);
+        $cashflowService->recordPenaltyPayment($penalty, $loan, $paymentAmount, $paidAt);
 
-        // Log the operation
-        Historique::create([
-            'recordIdFk' => $penalty->loanDocIdFk,
-            'recordStatus' => 'penalty_paid',
-            'operDescription' => 'Pénalité payée: ' . number_format($penalty->amount, 2) . ' USD',
-            'userIdFk' => Auth::id()
-        ]);
+        if ($isFullyPaid) {
+            $penalty->update([
+                'status' => 'paid',
+                'amount' => $totalPaidSoFar,
+                'paidAt' => $paidAt,
+                'paidAmount' => $totalPaidSoFar,
+            ]);
 
-        return true;
+            Historique::create([
+                'recordIdFk' => $penalty->loanDocIdFk,
+                'recordStatus' => 'penalty_paid',
+                'operDescription' => 'Pénalité soldée: ' . number_format($totalPaidSoFar, 2) . ' USD',
+                'userIdFk' => Auth::id(),
+            ]);
+        } else {
+            $penalty->update([
+                'status' => 'notPaid',
+                'amount' => $newRemaining,
+                'paidAmount' => $totalPaidSoFar,
+                'paidAt' => null,
+            ]);
+
+            Historique::create([
+                'recordIdFk' => $penalty->loanDocIdFk,
+                'recordStatus' => 'penalty_partial_paid',
+                'operDescription' => 'Paiement partiel pénalité: ' . number_format($paymentAmount, 2)
+                    . ' USD (reste ' . number_format($newRemaining, 2) . ' USD)',
+                'userIdFk' => Auth::id(),
+            ]);
+        }
+
+        return [
+            'success' => true,
+            'fully_paid' => $isFullyPaid,
+            'payment_amount' => $paymentAmount,
+            'remaining' => $isFullyPaid ? 0 : $newRemaining,
+        ];
     }
 
     /**

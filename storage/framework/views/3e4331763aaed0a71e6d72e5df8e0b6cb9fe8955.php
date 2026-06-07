@@ -8,9 +8,15 @@
         <div class="d-flex justify-content-between align-items-center mb-4">
             <h2><i class="fas fa-exclamation-triangle me-2"></i>Gestion des pénalités</h2>
             <div class="d-flex gap-2">
-                <button onclick="calculateAllPenalties()" class="btn btn-warning">
-                    <i class="fas fa-calculator me-2"></i>Calculer toutes les pénalités
-                </button>
+                <?php if (app(\Illuminate\Contracts\Auth\Access\Gate::class)->check('create-penalties')): ?>
+                    <form method="POST" action="<?php echo e(route('penalties.recalculate-all')); ?>" class="d-inline"
+                          onsubmit="return confirm('Recalculer les pénalités pour tous les crédits ?\n\nSupprimez d\'abord les pénalités obsolètes en base si nécessaire.')">
+                        <?php echo csrf_field(); ?>
+                        <button type="submit" class="btn btn-warning">
+                            <i class="fas fa-sync-alt me-2"></i>Recalculer les pénalités
+                        </button>
+                    </form>
+                <?php endif; ?>
                 <a href="<?php echo e(route('caissiere.dashboard')); ?>" class="btn btn-outline-secondary">
                     <i class="fas fa-arrow-left me-2"></i>Retour au dashboard
                 </a>
@@ -286,8 +292,9 @@
                 <?php echo csrf_field(); ?>
                 <div class="modal-body">
                     <div class="mb-3">
-                        <label for="amount" class="form-label">Montant <span class="text-danger">*</span></label>
-                        <input type="number" step="0.01" class="form-control" id="amount" name="amount" required>
+                        <label for="amount" class="form-label">Montant à payer <span class="text-danger">*</span></label>
+                        <input type="number" step="0.01" min="0.01" class="form-control" id="amount" name="amount" required>
+                        <small class="text-muted" id="amountHelp">Entre 0,01 et le montant dû maximum.</small>
                     </div>
                     <div class="mb-3">
                         <label for="payment_date" class="form-label">Date de paiement <span class="text-danger">*</span></label>
@@ -306,37 +313,27 @@
 
 <?php $__env->startPush('scripts'); ?>
 <script>
-function calculateAllPenalties() {
-    if (confirm('Voulez-vous calculer les pénalités pour tous les crédits ?')) {
-        fetch('<?php echo e(route("penalties.calculate-all")); ?>', {
-            method: 'POST',
-            headers: {
-                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').getAttribute('content'),
-                'Content-Type': 'application/json',
-            }
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                location.reload();
-            } else {
-                alert('Erreur lors du calcul des pénalités');
-            }
-        })
-        .catch(error => {
-            console.error('Error:', error);
-            alert('Erreur lors du calcul des pénalités');
-        });
-    }
-}
-
 function payPenalty(penaltyId, amount) {
-    document.getElementById('amount').value = amount;
-    document.getElementById('payPenaltyForm').action = '<?php echo e(route("penalties.pay", ":id")); ?>'.replace(':id', penaltyId);
-    
-    const modal = new bootstrap.Modal(document.getElementById('payPenaltyModal'));
+    const modalEl = document.getElementById('payPenaltyModal');
+    const amountInput = document.getElementById('amount');
+    const roundedAmount = Math.round(parseFloat(amount) * 100) / 100;
+
+    amountInput.value = roundedAmount;
+    amountInput.min = 0.01;
+    amountInput.max = roundedAmount;
+    document.getElementById('amountHelp').textContent = 'Entre 0,01 et ' + roundedAmount.toFixed(2) + ' USD maximum.';
+    document.getElementById('payPenaltyForm').action = <?php echo json_encode(url('penalties'), 15, 512) ?> + '/' + penaltyId + '/pay';
+
+    const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
     modal.show();
 }
+
+document.getElementById('payPenaltyModal').addEventListener('hidden.bs.modal', function () {
+    document.querySelectorAll('.modal-backdrop').forEach(function (el) { el.remove(); });
+    document.body.classList.remove('modal-open');
+    document.body.style.removeProperty('overflow');
+    document.body.style.removeProperty('padding-right');
+});
 </script>
 <?php $__env->stopPush(); ?>
 <?php $__env->stopSection(); ?>

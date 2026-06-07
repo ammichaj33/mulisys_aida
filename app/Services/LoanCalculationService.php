@@ -9,6 +9,18 @@ use Carbon\Carbon;
 class LoanCalculationService
 {
     /**
+     * Corriger les années à 2 chiffres (ex: 0025 -> 2025).
+     */
+    public static function normalizeYear(Carbon $date): Carbon
+    {
+        if ($date->year < 100) {
+            return $date->copy()->year(2000 + $date->year);
+        }
+
+        return $date;
+    }
+
+    /**
      * Calculer les intérêts mensuels dégressifs avec capital restant
      */
     public function calculateMonthlyDegressiveInterest($montant, $taux, $duree, $dateDebut = null)
@@ -23,7 +35,7 @@ class LoanCalculationService
         $somDecressif = 0;
         
         // Utiliser le jour de la date de soumission pour chaque échéance
-        $dateBase = Carbon::parse($dateDebut);
+        $dateBase = self::normalizeYear(Carbon::parse($dateDebut));
         $jourSoumission = $dateBase->day;
         $annee = $dateBase->year;
         $mois = $dateBase->month;

@@ -76,4 +76,36 @@ class Penalty extends Model
     {
         return $this->belongsTo(User::class, 'createdBy');
     }
+
+    /**
+     * Montant total de la pénalité (payé + reste).
+     */
+    public function getTotalAmountAttribute()
+    {
+        if ($this->status === 'paid') {
+            return round(max((float) $this->paidAmount, (float) $this->amount), 2);
+        }
+
+        return round((float) ($this->paidAmount ?? 0) + (float) $this->amount, 2);
+    }
+
+    /**
+     * Reste à payer.
+     */
+    public function getRemainingAmountAttribute()
+    {
+        if ($this->status === 'paid') {
+            return 0;
+        }
+
+        return round((float) $this->amount, 2);
+    }
+
+    /**
+     * Paiement partiel en cours.
+     */
+    public function isPartiallyPaid()
+    {
+        return $this->status === 'notPaid' && (float) ($this->paidAmount ?? 0) > 0;
+    }
 }

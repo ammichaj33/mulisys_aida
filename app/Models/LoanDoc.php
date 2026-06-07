@@ -2,6 +2,8 @@
 
 namespace App\Models;
 
+use App\Services\LoanCalculationService;
+use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
@@ -26,10 +28,18 @@ class LoanDoc extends Model
     ];
 
     protected $casts = [
-        'submitDate' => 'date',
         'createdAt' => 'datetime',
         'updated_at' => 'datetime',
     ];
+
+    public function getSubmitDateAttribute($value)
+    {
+        if (!$value) {
+            return null;
+        }
+
+        return LoanCalculationService::normalizeYear(Carbon::parse($value));
+    }
 
     public function member()
     {
